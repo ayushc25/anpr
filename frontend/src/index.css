@@ -1,0 +1,147 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+
+  --bg: #0b0f1a;
+  --surface: #12172a;
+  --surface-alt: #0d1120;
+  --surface-alt-translucent: rgba(13, 17, 32, 0.8);
+  --border: #232a3d;
+  --border-soft: #1c2336;
+  --text-primary: #ffffff;
+  --text-secondary: #9aa1b5;
+  --text-muted: #6b7280;
+  --hover-1: rgba(255, 255, 255, 0.05);
+  --hover-2: rgba(255, 255, 255, 0.10);
+  --hover-3: rgba(255, 255, 255, 0.20);
+  --scrollbar-thumb: #2a3142;
+  --row-hover: #161c2e;
+  --table-row-border: #1a2032;
+  --chart-grid: #7c8398;
+  --chart-tooltip-bg: #12172a;
+  --chart-tooltip-border: #232a3d;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #f4f5f8;
+  --surface: #ffffff;
+  --surface-alt: #eef0f5;
+  --surface-alt-translucent: rgba(238, 240, 245, 0.85);
+  --border: #dde1ea;
+  --border-soft: #e4e7ef;
+  --text-primary: #12172a;
+  --text-secondary: #4b5165;
+  --text-muted: #7c8398;
+  --hover-1: rgba(10, 15, 30, 0.04);
+  --hover-2: rgba(10, 15, 30, 0.08);
+  --hover-3: rgba(10, 15, 30, 0.14);
+  --scrollbar-thumb: #cbd0dc;
+  --row-hover: #eef1f7;
+  --table-row-border: #e7eaf1;
+  --chart-grid: #7c8398;
+  --chart-tooltip-bg: #ffffff;
+  --chart-tooltip-border: #dde1ea;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+table.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+table.data-table th {
+  text-align: left;
+  color: var(--text-secondary);
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+table.data-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--table-row-border);
+  color: var(--text-secondary);
+}
+table.data-table tr:hover td {
+  background: var(--row-hover);
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border-radius: 6px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+.badge-registered, .badge-whitelist { background: rgba(46,204,113,0.15); color: #2ecc71; }
+.badge-blacklist { background: rgba(231,76,60,0.15); color: #e74c3c; }
+.badge-unknown { background: rgba(243,156,18,0.15); color: #f39c12; }
+
+/* Theme-aware neutral utilities, used in place of Tailwind's fixed
+   text-white, text-gray-N and bg-white opacity classes, so the whole app
+   follows the light/dark toggle instead of being permanently tuned for
+   dark mode. */
+.text-app-primary { color: var(--text-primary); }
+.text-app-secondary { color: var(--text-secondary); }
+.text-app-muted { color: var(--text-muted); }
+
+.bg-app { background: var(--bg); }
+.bg-app-alt { background: var(--surface-alt); }
+.bg-app-alt-blur { background: var(--surface-alt-translucent); backdrop-filter: blur(6px); }
+
+.border-app { border-color: var(--border); }
+.border-app-soft { border-color: var(--border-soft); }
+
+.field {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+}
+.field::placeholder { color: var(--text-muted); }
+
+.surface-1 { background: var(--hover-1); }
+.surface-2 { background: var(--hover-2); }
+.surface-3 { background: var(--hover-3); }
+.hover-surface-1:hover { background: var(--hover-1); }
+.hover-surface-2:hover { background: var(--hover-2); }
+.hover-surface-3:hover { background: var(--hover-3); }
+.hover-text-primary:hover { color: var(--text-primary); }

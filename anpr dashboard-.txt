@@ -1,0 +1,40 @@
+anpr dashboard-
+total vehicles count
+blacklisted vehicle count
+unknown vehicle count
+active cam count (online/offline)
+
+
+
+
+user- two
+one admin- add users , cam setup, can manage the list
+one manager- can manage the lists
+one user(guards)- no rights
+
+
+log history of all the changes done (login activity and any action taken 3 mnths )
+
+
+21/08/2026
+
+
+dashboard - vehicles out
+
+bicycle class addition
+
+subscription or distributor model
+security for partners and installation
+flat number in vehicle listing
+
+image should be saved on local according to cam name and time
+
+
+rights selection for every new user created
+
+terms and condition acception
+
+report page- per day report and type of vehicle filter
+
+
+theme- dark and day mode
