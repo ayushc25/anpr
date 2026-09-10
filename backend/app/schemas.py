@@ -1,8 +1,38 @@
-from datetime import datetime
-from typing import Optional, List
-from pydantic import BaseModel, ConfigDict
+from datetime import datetime, timezone
+from typing import Annotated, Optional, List
+from pydantic import BaseModel, BeforeValidator, ConfigDict, PlainSerializer
 
-from .models import VehicleStatus, CameraDirection
+from .models import VehicleStatus, CameraDirection, EventDirection
+
+
+def _as_utc_iso(value: Optional[datetime]) -> Optional[str]:
+    """Serialize a stored instant with an explicit UTC marker.
+
+    Every timestamp in this system is stored as naive UTC — the columns are
+    ``timestamp without time zone`` and the writers convert to UTC first. That
+    is fine as storage, but Pydantic then serialized it as
+    ``2026-09-08T11:31:15`` with no offset, and per the ECMAScript spec a
+    date-time string WITHOUT an offset is parsed as LOCAL time. So the browser
+    read 11:31 UTC as 11:31 local and rendered every event 5h30m early in
+    IST — the times looked plausible, which is why it went unnoticed.
+
+    Appending the marker is the whole fix for every table view: with an offset
+    present, ``new Date(...).toLocaleString()`` already converts correctly to
+    whatever timezone the viewer is in. No frontend change is needed, and the
+    stored values are correct and untouched.
+
+    A value that already carries a timezone is converted rather than assumed,
+    so this is safe if a column is ever migrated to ``timestamptz``.
+    """
+    if value is None:
+        return None
+    aware = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+    return aware.isoformat().replace("+00:00", "Z")
+
+
+#: A stored instant, serialized with an explicit UTC marker. Use this instead
+#: of a bare ``datetime`` for anything the API hands to a client.
+UtcDatetime = Annotated[datetime, PlainSerializer(_as_utc_iso, return_type=str, when_used="json")]
 
 
 # ---------- Auth ----------
@@ -41,7 +71,7 @@ class UserUpdate(BaseModel):
 class UserOut(UserBase):
     model_config = ConfigDict(from_attributes=True)
     id: int
-    created_at: datetime
+    created_at: UtcDatetime
 
 
 class PermissionOut(BaseModel):
@@ -65,7 +95,7 @@ class LocationCreate(LocationBase):
 class LocationOut(LocationBase):
     model_config = ConfigDict(from_attributes=True)
     id: int
-    created_at: datetime
+    created_at: UtcDatetime
 
 
 # ---------- Camera ----------
@@ -93,19 +123,29 @@ class CameraOut(CameraBase):
     model_config = ConfigDict(from_attributes=True)
     id: int
     is_online: bool
-    last_seen_at: Optional[datetime] = None
-    created_at: datetime
+    last_seen_at: Optional[UtcDatetime] = None
+    created_at: UtcDatetime
 
 
 # ---------- Vehicle ----------
+def _blank_if_none(value: Optional[str]) -> str:
+    """These columns are nullable in the database, and legacy rows predating
+    their defaults hold NULL. A single such row must not fail validation for
+    the whole list response, so coerce NULL to an empty string."""
+    return value or ""
+
+
+NullableStr = Annotated[str, BeforeValidator(_blank_if_none)]
+
+
 class VehicleBase(BaseModel):
     plate_number: str
-    owner_name: str = ""
-    flat_number: str = ""
-    vehicle_type: str = "car"
+    owner_name: NullableStr = ""
+    flat_number: NullableStr = ""
+    vehicle_type: NullableStr = "car"
     status: VehicleStatus = VehicleStatus.registered
-    valid_until: Optional[datetime] = None
-    notes: str = ""
+    valid_until: Optional[UtcDatetime] = None
+    notes: NullableStr = ""
 
 
 class VehicleCreate(VehicleBase):
@@ -117,15 +157,15 @@ class VehicleUpdate(BaseModel):
     flat_number: Optional[str] = None
     vehicle_type: Optional[str] = None
     status: Optional[VehicleStatus] = None
-    valid_until: Optional[datetime] = None
+    valid_until: Optional[UtcDatetime] = None
     notes: Optional[str] = None
 
 
 class VehicleOut(VehicleBase):
     model_config = ConfigDict(from_attributes=True)
     id: int
-    created_at: datetime
-    updated_at: datetime
+    created_at: UtcDatetime
+    updated_at: UtcDatetime
 
 
 # ---------- Event ----------
@@ -138,12 +178,16 @@ class EventOut(BaseModel):
     vehicle_type: str
     vehicle_color: Optional[str] = None
     plate_color: Optional[str] = None
-    direction: CameraDirection
+    direction: EventDirection
     status: VehicleStatus
+    # An event records what actually happened, so it uses EventDirection
+    # (in / out / unknown), not the camera's configured role which may be
+    # "both". Serving "unknown" through a CameraDirection field raised a
+    # validation error the moment a camera had no virtual line.
     confidence: float
     ocr_confidence: float
     image_path: Optional[str] = None
-    detected_at: datetime
+    detected_at: UtcDatetime
     camera_name: Optional[str] = None
     owner_name: Optional[str] = None
 
@@ -152,7 +196,7 @@ class EventCreate(BaseModel):
     plate_number: str
     camera_id: Optional[int] = None
     vehicle_type: str = "car"
-    direction: CameraDirection = CameraDirection.both
+    direction: EventDirection = EventDirection.unknown
     confidence: float = 0.0
     ocr_confidence: float = 0.0
     image_path: Optional[str] = None
@@ -201,4 +245,11 @@ class ActivityLogOut(BaseModel):
     username: str
     action: str
     details: str
-    created_at: datetime
+    created_at: UtcDatetime
+
+
+class ActivityLogPage(BaseModel):
+    items: List[ActivityLogOut]
+    total: int
+    page: int
+    page_size: int

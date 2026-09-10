@@ -16,12 +16,19 @@ ALGORITHM = "HS256"
 STORAGE_DIR = ROOT_DIR / "backend" / "storage" / "events"
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", str(ROOT_DIR / "yolo26n.pt"))
+# yolo26n.pt is BROKEN: it reports "refrigerator 0.72" on a frame full of cars,
+# and finds no vehicles at all. Verified against yolov8n.pt on the same frame,
+# which returns car 0.74 / car 0.59 / truck 0.37. Do not point this back at
+# yolo26n.pt without re-checking it on real footage.
+YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", str(ROOT_DIR / "yolov8n.pt"))
 PLATE_MODEL_PATH = os.getenv("PLATE_MODEL_PATH", str(ROOT_DIR / "license-plate-finetune-v1l.pt"))
 PLATE_CONF_THRESHOLD = float(os.getenv("PLATE_CONF_THRESHOLD", "0.25"))
 
 # Event dedupe window (seconds) - same plate on same camera won't create a new event within this window
-EVENT_DEDUPE_SECONDS = int(os.getenv("EVENT_DEDUPE_SECONDS", "20"))
+# Same vehicle on the same camera inside this window is one arrival, not
+# several. A vehicle waiting at a boom, or a test clip that loops, otherwise
+# produces a row every time the window lapses.
+EVENT_DEDUPE_SECONDS = int(os.getenv("EVENT_DEDUPE_SECONDS", "45"))
 
 # Vehicle classes we care about (COCO ids): bicycle=1, car=2, motorbike=3, bus=5, truck=7
 VEHICLE_CLASS_IDS = {1, 2, 3, 5, 7}
@@ -40,3 +47,17 @@ VEHICLE_CONF_THRESHOLD = float(os.getenv("VEHICLE_CONF_THRESHOLD", "0.20"))
 TRACK_IOU_THRESHOLD = float(os.getenv("TRACK_IOU_THRESHOLD", "0.25"))
 TRACK_TIMEOUT_SECONDS = float(os.getenv("TRACK_TIMEOUT_SECONDS", "2.5"))
 MIN_OCR_CONFIDENCE_TO_RECORD = float(os.getenv("MIN_OCR_CONFIDENCE_TO_RECORD", "0.35"))
+
+
+# --- throughput knobs ------------------------------------------------------
+# The plate detector + OCR cost ~400 ms per vehicle against ~120 ms for the
+# whole-frame vehicle detector, so the plate stages are what set the frame
+# rate. Cap how many vehicles per pass may pay that cost.
+MAX_PLATE_READS_PER_PASS = int(os.getenv("MAX_PLATE_READS_PER_PASS", "2"))
+
+# A vehicle smaller than this fraction of the frame is too far away for its
+# plate to be legible; reading it spends 400 ms to produce noise.
+MIN_VEHICLE_AREA_RATIO = float(os.getenv("MIN_VEHICLE_AREA_RATIO", "0.02"))
+
+# Live-view preview width. Encoding full 1080p costs ~64 ms per frame.
+PREVIEW_MAX_WIDTH = int(os.getenv("PREVIEW_MAX_WIDTH", "960"))

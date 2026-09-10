@@ -1,0 +1,340 @@
+# Pipeline defaults. Per-camera overrides live in configs/cameras/<code>.yaml
+# and in the cameras table; the database wins over both at runtime.
+
+pipeline:
+  processing_fps: 6.0        # frames per second actually put through the cascade
+  detect_interval: 2         # vehicle detector on 1-in-N processed frames
+  plate_interval: 2          # frames between plate attempts per track
+  max_plate_attempts: 40
+  min_vehicle_area_ratio: 0.010
+  min_roi_overlap: 0.30
+  min_plate_quality: 0.35
+  plate_crop_pad: 0.06
+  roi_crop_pad: 0.05
+  skip_classes: ["bicycle"]
+  max_track_seconds: 45.0
+  use_quad_warp: true
+  enhance_before_ocr: true
+  lock_min_reads: 4
+  lock_min_support: 0.90
+
+  # How a vehicle is tested against the READ ZONE (the near-field band inside
+  # the ROI where a plate on this camera is actually big enough to read; drawn
+  # per camera as an roi-kind zone named "read_zone", empty = whole ROI).
+  #
+  #   bottom_center  the plate-bearing end of the vehicle box must be inside
+  #                  the zone. Right for a 3-4 ft gate mount, and one
+  #                  point-in-polygon test.
+  #   overlap        min_read_zone_overlap of the whole vehicle box must be
+  #                  inside. Costs a rasterization; use only if the mounting
+  #                  makes the bottom edge unreliable.
+  read_zone_anchor: bottom_center
+  min_read_zone_overlap: 0.20
+
+  # Processed frames a track must survive before ANY plate work. A brand-new
+  # track has had one detection, its class may still flip, and it may be a
+  # shadow. 2 is ~0.33s at 6 fps; the tracker's own min_hits confirmation is
+  # the primary stability signal and this is the backstop.
+  min_track_age: 2
+
+  # --- plate-to-vehicle association --------------------------------------
+  # A detected plate must be geometrically consistent with its vehicle track.
+  # Several things at a gate are reliably plate-shaped and reliably not
+  # plates: the DVR timestamp bar, a bumper sticker, a windscreen permit, a
+  # painted phone number. All pass the detector's only checks (width >= 24 px,
+  # aspect 1.2-8.0). Pure arithmetic, run before quality scoring.
+  association:
+    enabled: true
+    # Fraction of the plate box allowed outside the vehicle box. Non-zero
+    # because the crop is padded and the vehicle box jitters while coasting.
+    inside_tolerance: 0.15
+    # Plate width as a fraction of vehicle width. Below = sticker-sized
+    # fragment; above = something spanning the vehicle. The upper bound is
+    # generous so a motorcycle's proportionally wide plate still passes.
+    min_width_ratio: 0.08
+    max_width_ratio: 0.65
+    # Plate centre position within the vehicle box, from the top. The lower
+    # band only: at a 3-4 ft mount both front and rear plates sit below the
+    # midline, so rejecting the upper band discards windscreen permits and
+    # roof-line reflections. SKIPPED when the vehicle box is vertically
+    # clipped, since its height is then a fragment.
+    min_vertical: 0.30
+    max_vertical: 1.02
+    # Reject a vehicle clipped by the LEFT or RIGHT frame edge - its width is
+    # a fragment, and width is what the ratios above are measured against.
+    # This is the "partially visible vehicle triggers a read" guard.
+    #
+    # HORIZONTAL ONLY, deliberately. At this mounting a vehicle driving toward
+    # the camera legitimately runs off the BOTTOM of the frame as it arrives,
+    # and those closest frames are the best the camera will ever get.
+    require_lateral_visibility: true
+    max_edge_clip: 0.02
+    # Reject a PLATE box touching the frame edge - a cut-off plate is read as
+    # a confident fragment. This is the geometric detector for the UP1606
+    # failure, cheaper and more reliable than catching it later by length.
+    require_whole_plate: true
+    plate_edge_margin: 2
+
+  # --- grammar-aware constrained decoding --------------------------------
+  # Evidence-driven character substitution, using the recognizer's own
+  # runner-up characters. Runs BEFORE the map-based postprocess.resolve path,
+  # which is unchanged.
+  #
+  # Only acts where a character's TYPE is illegal under a plate mask, so a
+  # confident legal choice is never overwritten. For DL7CP8161 read as
+  # CLZCP0161: position 2 must be a digit and Z is not one, and the model's
+  # own second choice is 7 - which no hand-written confusion map contains
+  # (ALPHA_TO_DIGIT['Z'] is ('2',), which would give the wrong answer).
+  #
+  # REQUIRES a recognizer that exposes per-timestep probabilities (ppocr_onnx
+  # or lprnet_onnx). Inert with easyocr_legacy, which reports per-BOX scores.
+  grammar_decode:
+    enabled: true
+    # Smallest probability an alternative may have to replace a character.
+    # Below a tenth it is distribution tail and substituting is guessing.
+    min_alternative_prob: 0.10
+    # How strong it must be relative to the character it displaces.
+    min_alternative_ratio: 0.25
+    # Most positions it may change. Matches repair's budget. A read needing
+    # three type fixes is a bad crop, not a misread, and stays UNRESOLVED.
+    max_substitutions: 2
+    # Constrain the two leading characters to a real RTO state code, using the
+    # model's alternatives. Type-preserving (letter for letter). This is the
+    # CL -> DL half of the example above: the mask is satisfied since both are
+    # letters, so only the state-code list can see the error.
+    state_code_constraint: true
+
+  # --- OCR scheduling ----------------------------------------------------
+  # Recognition is one to two orders of magnitude more expensive than
+  # localization, so it gets its own budget and its own cadence. Defaults are
+  # derived in backend/app/video/ocr_scheduler.py; the derivations are in the
+  # comments there, redo them for your own camera rather than trusting ours.
+  ocr:
+    # Readable width, NOT detectable width. The plate detector's floor is
+    # models.yaml plate_detector.min_width_px (24): we want to know a plate is
+    # there long before we are willing to pay to read it. Between
+    # MIN_USABLE_WIDTH_PX (45) and GOOD_WIDTH_PX (110), biased low because a
+    # marginal read costs one call and a refused one costs a vehicle.
+    # THE SINGLE MOST IMPORTANT KNOB TO CALIBRATE PER SITE.
+    min_plate_width_read: 70
+
+    # Quality tiers, read off the score formula (0.40*resolution +
+    # 0.30*sharpness + 0.15*aspect + 0.15*exposure):
+    #   0.55 ~ 84 px wide, moderately sharp — readable, not ideal
+    #   0.75 ~ 110 px wide and genuinely sharp — the frame we waited for
+    good_quality: 0.55
+    excellent_quality: 0.75
+
+    # Budget: total OCR calls one vehicle may ever consume.
+    #
+    # Six, not twelve. Twelve was sized for "about four seconds of
+    # eligibility" when every eligible frame was read. With diversity-aware
+    # retention and correlated-evidence discounting, most of those extra reads
+    # were near-duplicates that no longer count as independent observations
+    # anyway - so they cost a recognizer call each and bought almost nothing.
+    #
+    # Six is the floor that still clears the validator's min_reads of 3 with
+    # margin: two reads can fail the fragment or weight filters and the plate
+    # is still decidable. Below six that margin disappears.
+    #
+    # reserve is held back from the approach so a vehicle that dawdles on the
+    # way in can still be read once it reaches the boom.
+    budget_per_track: 6
+    reserve: 2
+    # Ceiling on recognizer calls per FRAME across all tracks — the hard
+    # guarantee that a queue of five vehicles cannot cost five OCR calls in
+    # one frame. A strictly single-lane gate can set this to 1.
+    max_per_frame: 2
+
+    # Frames between OCR calls on one track, by quality tier.
+    interval_excellent: 1
+    interval_good: 2
+    interval_marginal: 5
+
+    # Approach/departure detection, in observations.
+    growth_window: 3        # ~1s of approach at the default cadence
+    growth_ratio: 1.08      # >8% growth over the window = still approaching
+    departure_ratio: 0.85   # <=85% of peak width = best view has passed
+    max_consecutive_waits: 4  # safety valve: read anyway after this many
+
+    # Multiplier on plate_interval while a track is in a wait we already
+    # understand (too small / still approaching / holding reserve). Without it
+    # the pipeline saves the OCR call but keeps paying for the plate-detector
+    # call that produced the crop it declined. 3 = check about once a second
+    # at the defaults. Set 1 to disable.
+    wait_backoff: 3
+
+    # Skip recognition on a frame older than this when processing starts.
+    # ~2.4 frame periods at 6 fps. Set 0 to disable.
+    max_frame_age_ms: 400.0
+
+    # Extra calls granted ONCE to a track whose plate is one or two characters
+    # from settled. Spent on the best RETAINED crops the recognizer has not
+    # seen, not on future frames - a finalized track has no future frames.
+    retry_bonus: 2
+    retry_max_unstable: 2
+    retry_min_reads: 3
+
+    # Best-quality plate crops retained per track, for the event image, the
+    # approach signal and the targeted-retry pool.
+    #
+    # Retention is DIVERSITY-AWARE: an observation that looks near-identical to
+    # one already held replaces it if better and is discarded if not, rather
+    # than taking a second slot. A vehicle stopped at the boom otherwise fills
+    # every slot with copies of one view, which provides one crop and no
+    # signal - and the retry needs a crop the recognizer has NOT already
+    # failed on.
+    keep_observations: 6
+    # Appearance-hash distance (of 64 bits, see ai/quality/crop_hash) below
+    # which a new observation counts as the same view. Consecutive frames of a
+    # stationary vehicle sit at 0-3; a vehicle that has actually moved sits
+    # above 8. Six is inside that gap, biased toward calling frames similar.
+    diversity_hamming: 6
+
+validation:
+  min_reads: 3
+  min_read_weight: 0.05
+  strong_support: 0.60
+  margin: 0.15
+
+  # --- decision thresholds ------------------------------------------------
+  # Three recognition states, two thresholds:
+  #   >= confirm_confidence, well-formed, no unstable character -> CONFIRMED
+  #   >= min_final_confidence                                   -> PROBABLE
+  #   below, or incomplete                                      -> UNRESOLVED
+  min_final_confidence: 0.55
+  confirm_confidence: 0.80
+
+  # --- ANPR confidence weights (MUST sum to 1.0) --------------------------
+  # OCR CONFIDENCE IS NOT ANPR CONFIDENCE. The recognizer's own opinion is
+  # deliberately the smallest term: it was 0.30 when it was the only
+  # per-character signal, but per-character temporal fusion now produces a
+  # real posterior per position, which is better evidence about the same
+  # question. A model that is 94% sure of six glyphs has said nothing about
+  # whether those six glyphs are a whole registration.
+  weight_support: 0.35        # whole-string agreement across frames
+  weight_char_support: 0.35   # fused per-character posteriors
+  weight_ocr: 0.15            # the recognizer's own confidence
+  weight_quality: 0.15        # best plate-crop quality seen
+
+  # --- confidence caps ----------------------------------------------------
+  # Caps, not multipliers. A multiplier says "somewhat less likely"; a cap
+  # says "whatever the other evidence, the system will not claim more than
+  # this about a string it cannot show is a whole, well-formed plate".
+  # 0.94 * 0.7 = 0.66 still looks trustworthy to an operator. 0.35 does not.
+  cap_incomplete: 0.35        # too short to be a whole registration
+  cap_no_format: 0.50         # matches no known plate shape
+  cap_unknown_state: 0.75     # right shape, state code not in the RTO list
+
+  # --- per-character stability -------------------------------------------
+  # A position is unstable when the winner holds less than min_char_posterior
+  # of the total probability mass (including the mass the recognizer withheld)
+  # or leads its runner-up by less than min_char_margin. Any unstable position
+  # blocks CONFIRMED, however high the aggregate score.
+  min_char_posterior: 0.55
+  min_char_margin: 0.20
+  # Posterior credited to a position where the plate format excludes the
+  # runner-up (mask says letter, model said B, runner-up was 8). Real evidence
+  # the recognizer does not have, so not crediting it made the weakest-
+  # character rule harsher than the facts warranted.
+  grammar_floor: 0.85
+  # How much the WEAKEST position dominates char_support. Pure minimum (1.0)
+  # scored nine positions at 0.99 plus one at 0.50 the same as ten at 0.50,
+  # though the first is one character from settled. 0.70 keeps the weakest
+  # firmly in charge without making it the only thing that counts.
+  char_min_weight: 0.70
+
+  # Near-identical frames are NOT independent observations. Four consecutive
+  # frames of a vehicle stopped at the boom are one look sampled four times:
+  # same crop, same angle, same glare, so the same error four times over. A
+  # cluster of n such reads contributes sqrt(n) rather than n times its
+  # weight - the standard correction for correlated samples. Genuinely
+  # different views are untouched.
+  #
+  # Both signals are required to form a cluster: appearance alone would merge
+  # two separate passes of a similar vehicle, the frame gap alone would merge
+  # frames across a real change.
+  cluster_hamming: 6
+  cluster_frame_gap: 4
+
+  # --- registry snapping --------------------------------------------------
+  snap_below: 0.85
+  registry_snap: true
+  # A character position the frames settled at or above this posterior is not
+  # up for revision by the registry. Snapping exists to resolve characters we
+  # were UNSURE about; without this guard it can quietly turn a correctly-read
+  # visitor's plate into a resident's.
+  snap_protect_posterior: 0.80
+
+  drop_low_confidence: true
+  require_grammar: false
+
+dedupe:
+  same_direction_seconds: 25.0
+  reversal_seconds: 12.0
+
+reader:
+  reconnect_min: 2.0
+  reconnect_max: 60.0
+  read_timeout: 15.0
+  open_timeout_ms: 8000
+
+runtime:
+  # Cores held back for the API process, Postgres and the OS. Without this the
+  # workers starve the services they write to.
+  reserve_cores: 1
+  model_cache_dir: .cache/openvino
+  # Preview JPEGs are only encoded while someone is watching the live view.
+  preview_fps: 5.0
+  preview_jpeg_quality: 70
+
+storage:
+  media_root: backend/storage/events
+  keep_plate_crops: true
+  retention_days: 90
+  event_reads_retention_days: 30
+
+# --- development / debug artifact capture ---------------------------------
+# Saves, for EVERY OCR call: the vehicle crop, the raw plate crop, the warped
+# crop, the enhanced crop the recognizer actually saw, the raw OCR output, the
+# per-character probabilities and alternatives, and the final resolved verdict.
+#
+# The four images separate causes that are indistinguishable in a log - a badly
+# framed detector box, a bad deskew, and an enhancement that crushed a
+# low-contrast plate all produce the same wrong string.
+#
+# The per-character alternatives are the raw material for a real confusion
+# matrix: rather than guessing which glyph pairs this model confuses, they can
+# be COUNTED from recorded evidence. Until that dataset exists the confusion
+# maps in postprocess stay exactly as they are.
+#
+# TEMPORARY, for building an evaluation/error dataset. Recording every call
+# writes four JPEGs and a JSON per recognizer call - tens of MB an hour at a
+# busy gate. Leave disabled in production; `cli worker --debug` turns it on for
+# one worker without editing this file.
+debug:
+  enabled: false
+  dir: backend/storage/debug
+  max_tracks: 50
+  max_bytes: 500000000
+  jpeg_quality: 92
+
+# --- locale ----------------------------------------------------------------
+# Timestamps are STORED in UTC and that does not change — UTC is the only sane
+# storage format for an instant, and every column already holds it. What was
+# missing was a statement of what to convert it to for a human, and that gap
+# made every displayed time wrong.
+#
+# Three things read this:
+#   * the API, which now serializes instants with an explicit UTC marker so a
+#     browser converts them correctly on its own;
+#   * the dashboard trend chart, which buckets by LOCAL hour (bucketing the
+#     raw UTC column charted 17:00 traffic at 11:00, and because IST is a
+#     half-hour offset it also split each local hour across two bars);
+#   * "today" and "day" boundaries in the dashboard and reports, which used
+#     midnight UTC = 05:30 IST, so night-shift vehicles landed on the wrong day.
+#
+# IANA name; anything in the tz database works and DST is handled where it
+# applies. Falls back to UTC with a warning if the name is unknown.
+locale:
+  display_timezone: Asia/Kolkata

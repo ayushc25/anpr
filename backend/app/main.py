@@ -1,73 +1,89 @@
-import json
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-
-logging.basicConfig(level=logging.INFO)
-logging.getLogger("anpr").setLevel(logging.INFO)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from sqlalchemy import text, inspect
+from .api.v1.router import api_router
+from .core.config import get_settings
+from .routers import auth, cameras, dashboard, events, locations, logs, reports, users, vehicles
 
-from .database import Base, engine
-from .config import STORAGE_DIR
-from .permissions import PERMISSION_KEYS
-from .routers import auth, users, locations, cameras, vehicles, events, dashboard, reports, logs
-from .services import camera_manager
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("anpr").setLevel(logging.INFO)
+logger = logging.getLogger("anpr.main")
 
-
-def _run_lightweight_migrations():
-    """No migration framework is in place yet, so new nullable columns are
-    added by hand here with IF NOT EXISTS - create_all() only creates
-    missing tables, it never alters existing ones."""
-    statements = [
-        "ALTER TABLE events ADD COLUMN IF NOT EXISTS vehicle_color VARCHAR(32)",
-        "ALTER TABLE events ADD COLUMN IF NOT EXISTS plate_color VARCHAR(32)",
-        "ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS flat_number VARCHAR(32)",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS role_name VARCHAR(64) NOT NULL DEFAULT ''",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSON NOT NULL DEFAULT '[]'::json",
-    ]
-    with engine.begin() as conn:
-        for stmt in statements:
-            conn.execute(text(stmt))
-
-    # One-time backfill: the fixed admin/manager/guard `role` enum column is
-    # being replaced by a free-text role_name plus a per-user permissions
-    # list, so translate any pre-existing rows before dropping the old column.
-    inspector = inspect(engine)
-    columns = {c["name"] for c in inspector.get_columns("users")}
-    if "role" in columns:
-        all_keys = PERMISSION_KEYS
-        manager_keys = [k for k in PERMISSION_KEYS if k != "users"]
-        guard_keys = ["dashboard", "live", "events", "vehicles"]
-        with engine.begin() as conn:
-            conn.execute(text(
-                "UPDATE users SET role_name = 'Administrator', permissions = :perms "
-                "WHERE role = 'admin' AND role_name = ''"
-            ), {"perms": json.dumps(all_keys)})
-            conn.execute(text(
-                "UPDATE users SET role_name = 'Manager', permissions = :perms "
-                "WHERE role = 'manager' AND role_name = ''"
-            ), {"perms": json.dumps(manager_keys)})
-            conn.execute(text(
-                "UPDATE users SET role_name = 'Guard', permissions = :perms "
-                "WHERE role = 'guard' AND role_name = ''"
-            ), {"perms": json.dumps(guard_keys)})
-            conn.execute(text("ALTER TABLE users DROP COLUMN role"))
+settings = get_settings()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    Base.metadata.create_all(bind=engine)
-    _run_lightweight_migrations()
-    camera_manager.start_all_cameras()
-    yield
-    camera_manager.stop_all_cameras()
+    """Schema changes are Alembic's job now, not startup's.
+
+    The previous ``_run_lightweight_migrations()`` ran ALTER TABLE statements
+    here on every boot. That could add a column but never rename one, backfill
+    data or roll back — all of which the Phase 1 schema needed. Run:
+
+        cd backend && alembic upgrade head
+
+    Camera workers are mid-migration. The legacy in-process workers still run
+    here because the UI starts them on camera create/update; the replacement
+    runs each camera in its own OS process under
+    ``python -m backend.app.cli supervisor``. See the flag below.
+    """
+    _warn_if_migrations_pending()
+
+    # The UI still drives the legacy in-process camera workers: routers/
+    # cameras.py starts one on create/update, so without starting the enabled
+    # ones here a restart leaves every camera dead until someone re-saves it.
+    #
+    # This is the last piece of inference still living inside FastAPI. Set
+    # ENABLE_LEGACY_CAMERA_WORKERS=0 once the UI is switched over to the
+    # supervisor (`python -m backend.app.cli supervisor`), which runs each
+    # camera in its own process with the validated pipeline.
+    legacy = os.getenv("ENABLE_LEGACY_CAMERA_WORKERS", "1") not in ("0", "false", "False")
+    if legacy:
+        from .services import camera_manager
+
+        logger.warning(
+            "starting LEGACY in-process camera workers. These use the old "
+            "single-frame pipeline; run 'python -m backend.app.cli supervisor' "
+            "and set ENABLE_LEGACY_CAMERA_WORKERS=0 for the validated one."
+        )
+        camera_manager.start_all_cameras()
+    try:
+        yield
+    finally:
+        if legacy:
+            from .services import camera_manager
+
+            camera_manager.stop_all_cameras()
 
 
-app = FastAPI(title="ANPR System API", version="1.0.0", lifespan=lifespan)
+def _warn_if_migrations_pending() -> None:
+    try:
+        from alembic.script import ScriptDirectory
+        from sqlalchemy import text
+
+        from .db.session import engine
+
+        script = ScriptDirectory(str(settings.root_dir / "backend" / "alembic"))
+        head = script.get_current_head()
+        with engine.connect() as connection:
+            current = connection.execute(text("SELECT version_num FROM alembic_version")).scalar()
+        if current != head:
+            logger.warning(
+                "DATABASE SCHEMA IS OUT OF DATE (at %s, head is %s). Run: cd backend && alembic upgrade head",
+                current, head,
+            )
+    except Exception:
+        # A missing alembic_version table just means migrations have never
+        # run; that is worth a hint, not a crash on startup.
+        logger.warning("could not verify schema version; run 'cd backend && alembic upgrade head'")
+
+
+app = FastAPI(title="ANPR System API", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -77,19 +93,41 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/media", StaticFiles(directory=str(STORAGE_DIR)), name="media")
+app.mount("/media", StaticFiles(directory=str(settings.media_root)), name="media")
 
-app.include_router(auth.router)
-app.include_router(users.router)
-app.include_router(locations.router)
-app.include_router(cameras.router)
-app.include_router(vehicles.router)
-app.include_router(events.router)
-app.include_router(dashboard.router)
-app.include_router(reports.router)
-app.include_router(logs.router)
+app.include_router(api_router)
+
+# Prototype routers, still at their original paths so the existing frontend
+# keeps working while they are migrated into api/v1 one at a time.
+for router in (auth, users, locations, cameras, vehicles, events, dashboard, reports, logs):
+    app.include_router(router.router)
 
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "ANPR System API"}
+    return {"status": "ok", "service": "ANPR System API", "version": app.version}
+
+
+@app.get("/health")
+def health():
+    """Liveness plus the things that actually break on an edge box."""
+    from sqlalchemy import text
+
+    from .db.session import engine
+
+    checks = {"database": False, "media_writable": False}
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        checks["database"] = True
+    except Exception:
+        logger.warning("health: database unreachable", exc_info=True)
+    try:
+        probe = settings.media_root / ".healthcheck"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        checks["media_writable"] = True
+    except Exception:
+        logger.warning("health: media directory not writable", exc_info=True)
+
+    return {"status": "ok" if all(checks.values()) else "degraded", "checks": checks}

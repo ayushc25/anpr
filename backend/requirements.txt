@@ -1,15 +1,41 @@
+# --- API ---------------------------------------------------------------
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
-sqlalchemy==2.0.36
-psycopg2-binary==2.9.10
-python-dotenv==1.0.1
 pydantic==2.10.3
 pydantic-settings==2.6.1
+python-multipart==0.0.20
+httpx==0.28.1
+
+# --- database ----------------------------------------------------------
+sqlalchemy==2.0.36
+alembic==1.14.0
+psycopg2-binary==2.9.10
+
+# --- auth --------------------------------------------------------------
 python-jose[cryptography]==3.3.0
 bcrypt==5.0.0
-python-multipart==0.0.20
+
+# --- config / io -------------------------------------------------------
+python-dotenv==1.0.1
+pyyaml==6.0.2
 openpyxl==3.1.5
-opencv-python==4.10.0.84
-ultralytics==8.3.40
-easyocr==1.7.2
+requests==2.32.3
+
+# --- vision / inference ------------------------------------------------
+# The SERVING path is onnxruntime only. torch/ultralytics are NOT here on
+# purpose: they are build-time tools for scripts/export_onnx.py and belong in
+# requirements-dev.txt, which an edge box never installs.
+opencv-python-headless==4.10.0.84
 numpy==1.26.4
+onnxruntime==1.20.1
+scipy==1.14.1          # Hungarian assignment in the tracker (greedy fallback if absent)
+psutil==6.1.0          # physical core count for the thread budget
+
+# --- optional ----------------------------------------------------------
+# OpenVINO Execution Provider: ~25-45% faster on Intel CPUs. Install INSTEAD
+# of onnxruntime above (they conflict), then set backend: openvino or auto.
+#   pip uninstall onnxruntime && pip install onnxruntime-openvino==1.20.0
+#
+# EasyOCR: the prototype's recognizer, kept for A/B against the ONNX heads.
+# Pulls in torch (~2 GB) — install only where you are actually comparing.
+#   pip install easyocr==1.7.2

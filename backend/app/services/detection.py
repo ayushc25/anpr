@@ -8,7 +8,6 @@ used as the primary localization method. A contour/edge heuristic remains
 as a fallback for on the rare frame the plate model misses.
 """
 import logging
-import re
 import threading
 from typing import Optional
 
@@ -17,6 +16,7 @@ import numpy as np
 
 logger = logging.getLogger("anpr.detection")
 
+from ..ai.plate_recognizer import postprocess
 from ..config import (
     YOLO_MODEL_PATH,
     VEHICLE_CLASS_IDS,
@@ -26,6 +26,7 @@ from ..config import (
 )
 
 _model = None
+_budget = None
 _model_lock = threading.Lock()
 _plate_model = None
 _plate_model_lock = threading.Lock()
@@ -34,7 +35,6 @@ _ocr_lock = threading.Lock()
 
 COCO_VEHICLE_NAMES = {1: "bicycle", 2: "car", 3: "motorbike", 5: "bus", 7: "truck"}
 
-PLATE_RE = re.compile(r"[A-Z0-9]{5,12}")
 OCR_ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 # Hue band upper-bounds (OpenCV H range 0-179) used for nearest-match
@@ -48,23 +48,50 @@ _HUE_NAMES = [
 ]
 
 
+def _thread_budget():
+    """Shared budget for this process. The legacy workers are threads inside
+    the API, so they share one ORT pool rather than one each."""
+    global _budget
+    if _budget is None:
+        from ..ai.inference.threading import compute_budget, configure_opencv
+
+        _budget = compute_budget(1)
+        configure_opencv(_budget)
+    return _budget
+
+
 def get_model():
+    """Vehicle detector, ONNX.
+
+    Measured on a 1080p frame: the Ultralytics .pt path cost ~800 ms per call,
+    the ONNX export ~117 ms. Same weights, same results — the difference is
+    torch's overhead, which an edge box should not be paying at all.
+    """
     global _model
     if _model is None:
         with _model_lock:
             if _model is None:
-                from ultralytics import YOLO
-                _model = YOLO(YOLO_MODEL_PATH)
+                from ..ai.registry import build_vehicle_detector
+                from ..core.config import model_config
+
+                _model = build_vehicle_detector(model_config("vehicle_detector"), _thread_budget())
+                _model.warmup(2)
+                logger.info("vehicle detector ready (%s)", _model.name)
     return _model
 
 
 def get_plate_model():
+    """Plate detector, ONNX. 2713 ms -> 206 ms per call versus the .pt."""
     global _plate_model
     if _plate_model is None:
         with _plate_model_lock:
             if _plate_model is None:
-                from ultralytics import YOLO
-                _plate_model = YOLO(PLATE_MODEL_PATH)
+                from ..ai.registry import build_plate_detector
+                from ..core.config import model_config
+
+                _plate_model = build_plate_detector(model_config("plate_detector"), _thread_budget())
+                _plate_model.warmup(2)
+                logger.info("plate detector ready (%s)", _plate_model.name)
     return _plate_model
 
 
@@ -80,22 +107,12 @@ def get_ocr_reader():
 
 def detect_vehicles(frame: np.ndarray):
     """Returns list of dicts: {bbox:(x1,y1,x2,y2), conf, vehicle_type}"""
-    model = get_model()
-    results = model.predict(frame, verbose=False, conf=VEHICLE_CONF_THRESHOLD)
-    detections = []
-    for r in results:
-        for box in r.boxes:
-            cls_id = int(box.cls[0])
-            if cls_id not in VEHICLE_CLASS_IDS:
-                continue
-            x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
-            conf = float(box.conf[0])
-            detections.append({
-                "bbox": (x1, y1, x2, y2),
-                "conf": conf,
-                "vehicle_type": COCO_VEHICLE_NAMES.get(cls_id, "vehicle"),
-            })
-    return detections
+    detections = get_model().detect(frame)
+    return [
+        {"bbox": d.bbox, "conf": d.confidence, "vehicle_type": d.class_name}
+        for d in detections
+        if d.confidence >= VEHICLE_CONF_THRESHOLD
+    ]
 
 
 def _vehicle_crop(frame: np.ndarray, bbox):
@@ -106,6 +123,26 @@ def _vehicle_crop(frame: np.ndarray, bbox):
     if x2 <= x1 or y2 <= y1:
         return None
     return frame[y1:y2, x1:x2]
+
+
+#: A plate box this close to the frame border is treated as running off the
+#: edge. Two pixels rather than zero: the detector's box rarely lands exactly
+#: on the boundary even when the plate plainly continues past it.
+FRAME_EDGE_MARGIN_PX = 2
+
+
+def _touches_frame_edge(box_abs, frame_shape) -> bool:
+    """Whether a plate box in FRAME coordinates runs off the side of the view.
+
+    A vehicle entering or leaving the field of view presents a plate the
+    camera can only half see, and the recognizer reads that half at full
+    confidence — it cannot know the characters continue past the border. The
+    check is deliberately left/right only: a plate clipped top or bottom
+    still shows every character, just shortened.
+    """
+    x1, _, x2, _ = box_abs
+    width = frame_shape[1]
+    return x1 <= FRAME_EDGE_MARGIN_PX or x2 >= width - FRAME_EDGE_MARGIN_PX
 
 
 def _heuristic_plate_box(crop_shape):
@@ -121,18 +158,17 @@ def _model_plate_candidates(crop: np.ndarray):
     vehicle crop. Returns boxes (in crop coordinates) sorted by detector
     confidence, each padded slightly so OCR doesn't clip plate edge chars."""
     try:
-        model = get_plate_model()
-        results = model.predict(crop, verbose=False, conf=PLATE_CONF_THRESHOLD)
+        candidates = get_plate_model().detect(crop)
     except Exception:
         logger.exception("plate model inference failed")
         return []
 
     h, w = crop.shape[:2]
     found = []
-    for r in results:
-        for box in r.boxes:
-            x1, y1, x2, y2 = [float(v) for v in box.xyxy[0].tolist()]
-            conf = float(box.conf[0])
+    if True:
+        for cand in candidates:
+            x1, y1, x2, y2 = [float(v) for v in cand.bbox]
+            conf = float(cand.confidence)
             pad_x = (x2 - x1) * 0.08
             pad_y = (y2 - y1) * 0.15
             bx1 = max(int(x1 - pad_x), 0)
@@ -172,8 +208,13 @@ def _contour_plate_candidates(gray: np.ndarray):
 def _preprocess_for_ocr(roi: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim == 3 else roi
     h, w = gray.shape[:2]
-    if w < 220:
-        scale = 220 / max(w, 1)
+    # EasyOCR's recognizer normalizes to a fixed height, so a crop narrower
+    # than this gets upsampled inside the model from whatever it was given.
+    # Doing it here with a cubic filter, before CLAHE, measurably beats
+    # letting the model stretch a 90 px plate: the gate camera's far lane is
+    # exactly that size.
+    if w < 320:
+        scale = 320 / max(w, 1)
         gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     return clahe.apply(gray)
@@ -186,22 +227,38 @@ def _ocr_roi(roi: np.ndarray):
     try:
         processed = _preprocess_for_ocr(roi)
         reader = get_ocr_reader()
-        results = reader.readtext(processed, allowlist=OCR_ALLOWLIST)
+        # recognize() instead of readtext(): readtext runs EasyOCR's CRAFT
+        # text-DETECTION network first, which is the expensive half (732 ms vs
+        # 214 ms measured). We already localized the plate with the plate
+        # detector, so re-detecting text inside that crop is pure waste.
+        grey = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY) if processed.ndim == 3 else processed
+        height, width = grey.shape[:2]
+        results = reader.recognize(
+            grey, horizontal_list=[[0, width, 0, height]], free_list=[], allowlist=OCR_ALLOWLIST
+        )
     except Exception:
         logger.exception("OCR read failed")
         return None, 0.0
 
-    best_text, best_conf = None, 0.0
+    # Score every reading by confidence AND by how plate-shaped it is, rather
+    # than taking the most confident string outright. EasyOCR is routinely
+    # confident about the wrong thing — it will report the emblem strip or the
+    # dealer sticker at 0.9 — and on a crop that yields two readings, the one
+    # that parses as a real plate is the answer even when it scores lower.
+    best_text, best_conf, best_score = None, 0.0, 0.0
     for _, text, conf in results:
-        cleaned = re.sub(r"[^A-Z0-9]", "", text.upper())
-        if PLATE_RE.fullmatch(cleaned) and conf > best_conf:
-            best_text, best_conf = cleaned, conf
-    if best_text is None:
-        for _, text, conf in results:
-            cleaned = re.sub(r"[^A-Z0-9]", "", text.upper())
-            if len(cleaned) >= 5 and conf > best_conf:
-                best_text, best_conf = cleaned, conf
-    return best_text, best_conf
+        cleaned = postprocess.normalize(text)
+        if len(cleaned) < postprocess.MIN_LEN:
+            continue
+        conf = float(conf)
+        score = conf * postprocess.grammar_factor(postprocess.resolve(cleaned).text)
+        if score > best_score:
+            best_text, best_conf, best_score = cleaned, conf, score
+    # EasyOCR returns numpy scalars. psycopg2 has no adapter for np.float64
+    # and renders it as the literal text "np.float64(0.8)", which Postgres
+    # then rejects with 'schema "np" does not exist' — so an event that got
+    # this far would fail to insert. Coerce at the boundary.
+    return best_text, float(best_conf)
 
 
 def read_plate(frame: np.ndarray, bbox):
@@ -229,13 +286,22 @@ def read_plate(frame: np.ndarray, bbox):
             boxes = [_heuristic_plate_box(crop.shape)]
 
     ox1, oy1 = max(bbox[0], 0), max(bbox[1], 0)
-    best_text, best_conf, best_box_abs = None, 0.0, None
+    best_text, best_conf, best_box_abs, best_score = None, 0.0, None, 0.0
     for (bx1, by1, bx2, by2) in boxes:
         roi = crop[by1:by2, bx1:bx2]
         text, conf = _ocr_roi(roi)
-        if text and conf > best_conf:
-            best_text, best_conf = text, conf
-            best_box_abs = (ox1 + bx1, oy1 + by1, ox1 + bx2, oy1 + by2)
+        if not text:
+            continue
+        # Same rule as within a crop: across candidate boxes, a plate-shaped
+        # reading beats a more confident one that is not shaped like a plate.
+        # The fallback contour box in particular often frames a bumper sticker.
+        box_abs = (ox1 + bx1, oy1 + by1, ox1 + bx2, oy1 + by2)
+        if _touches_frame_edge(box_abs, frame.shape):
+            continue
+        score = conf * postprocess.grammar_factor(postprocess.resolve(text).text)
+        if score > best_score:
+            best_text, best_conf, best_score = text, conf, score
+            best_box_abs = box_abs
     return best_text, best_conf, best_box_abs
 
 
@@ -352,4 +418,11 @@ def get_plate_color(frame: np.ndarray, plate_box_abs) -> Optional[str]:
         bg_pixels = roi.reshape(-1, 3)
 
     dominant = _dominant_from_pixels(bg_pixels, k=2)
-    return _classify_bgr(dominant, ref_v=ref_v) if dominant is not None else None
+    if dominant is None:
+        return None
+    # Snap onto the closed set of Indian plate categories (white private,
+    # yellow commercial, green electric ...) so "silver" or "orange" does not
+    # reach the UI, where the colour is read as the vehicle's category.
+    from ..ai.color import _snap_to_plate_category
+
+    return _snap_to_plate_category(_classify_bgr(dominant, ref_v=ref_v))

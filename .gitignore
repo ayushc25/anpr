@@ -47,3 +47,8 @@ coverage/
 *.tmp
 *.bak
 artifacts/
+
+# ONNX artifacts: large binaries, produced by scripts/export_onnx.py
+models/*/
+!models/manifest.yaml
+.cache/

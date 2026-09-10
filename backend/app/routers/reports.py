@@ -10,6 +10,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font
 
 from .. import models, schemas
+from ..core.config import get_settings
 from ..database import get_db
 from ..deps import get_current_user
 
@@ -37,14 +38,20 @@ def daily_summary(
         params["date_to"] = date_to
     where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
+    # A "day" means a LOCAL day. Grouping the naive-UTC column directly put the
+    # boundary at midnight UTC — 05:30 in IST — so every vehicle between local
+    # midnight and 05:30 was reported on the previous day.
+    params["display_tz"] = get_settings().locale.display_timezone
+    local_day = "date_trunc('day', detected_at AT TIME ZONE 'UTC' AT TIME ZONE :display_tz)"
+
     total = db.execute(
-        text(f"SELECT COUNT(DISTINCT date_trunc('day', detected_at)) FROM events {where_sql}"),
+        text(f"SELECT COUNT(DISTINCT {local_day}) FROM events {where_sql}"),
         params,
     ).scalar() or 0
 
     rows = db.execute(
         text(f"""
-            SELECT date_trunc('day', detected_at) AS day,
+            SELECT {local_day} AS day,
                    COUNT(*) AS total,
                    COUNT(*) FILTER (WHERE direction = 'in_') AS entries,
                    COUNT(*) FILTER (WHERE direction = 'out_') AS exits,
@@ -98,11 +105,11 @@ def _write_detailed_sheet(ws, events):
             e.camera.name if e.camera else "",
             e.direction.value if e.direction else "",
             e.status.value,
-            e.vehicle.owner_name if e.vehicle else "",
-            e.vehicle.flat_number if e.vehicle else "",
-            round(e.confidence, 2),
-            round(e.ocr_confidence, 2),
-            e.image_path or "",
+            e.vehicle.display_owner if e.vehicle else "",
+            e.vehicle.display_flat if e.vehicle else "",
+            round(e.detect_confidence or 0.0, 2),
+            round(e.plate_confidence or 0.0, 2),
+            e.vehicle_image_path or "",
         ])
     _autosize_columns(ws)
 

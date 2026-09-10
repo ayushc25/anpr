@@ -1,0 +1,69 @@
+# Which implementation and which artifact per pipeline stage.
+#
+# `impl` is resolved by backend/app/ai/registry.py; every other key is passed
+# to that class's constructor. Changing a model is a change to this file, never
+# to pipeline code.
+#
+# `backend` selects the inference runtime independently of the model:
+#   auto      - OpenVINO EP on Intel when available, else the ORT CPU provider
+#   cpu       - ONNX Runtime CPU provider (portable: AMD, ARM)
+#   openvino  - force the OpenVINO Execution Provider
+
+vehicle_detector:
+  impl: yolo_onnx
+  artifact: models/vehicle/yolov8n_640.onnx
+  backend: auto
+  input_size: [640, 640]
+  conf_threshold: 0.30
+  nms_iou: 0.50
+  max_detections: 30
+  classes:
+    1: bicycle
+    2: car
+    3: motorcycle
+    5: bus
+    7: truck
+
+tracker:
+  impl: bytetrack
+  track_thresh: 0.35
+  match_thresh: 0.80
+  low_thresh: 0.10
+  track_buffer: 45       # processed frames, not seconds: ~7s at 6 fps
+  min_hits: 2
+
+plate_detector:
+  impl: yolo_plate_onnx
+  artifact: models/plate/license-plate-finetune-v1l_320.onnx
+  backend: auto
+  input_size: [320, 320]
+  conf_threshold: 0.30
+  nms_iou: 0.45
+  max_plates: 2
+  min_width_px: 24
+  filter_aspect: true
+
+plate_recognizer:
+  # Runnable default: EasyOCR is already installed, so the pipeline works out
+  # of the box. It is NOT the Phase 1 target — it loads a torch runtime and
+  # costs 60-200 ms per crop against 1-3 ms for the ONNX heads below.
+  #
+  # To upgrade (one command, then swap the impl):
+  #   python scripts/fetch_recognizer.py --ppocr
+  impl: easyocr_legacy
+  min_char_confidence: 0.30
+
+  # --- Phase 1 target: uncomment after fetch_recognizer.py ---------------
+  # impl: ppocr_onnx
+  # artifact: models/recognizer/ppocr_rec_en.onnx
+  # charset: models/recognizer/charset.txt
+  # backend: auto
+  # height: 48
+  # max_width: 320
+  # min_char_confidence: 0.40
+
+  # --- Phase 2 target: fine-tuned on harvested Indian plates -------------
+  # impl: lprnet_onnx
+  # artifact: models/recognizer/lprnet_in_v1.onnx
+  # charset: models/recognizer/charset.txt
+  # input_size: [96, 48]

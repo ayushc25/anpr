@@ -1,0 +1,15 @@
+# Build- and test-time only. An edge box installs requirements.txt, never this.
+-r requirements.txt
+
+pytest==8.3.4
+pytest-cov==6.0.0
+
+# Model export: torch comes in with ultralytics (~2 GB). Needed to turn .pt
+# weights into the ONNX artifacts the serving path loads, and nothing else.
+ultralytics==8.3.40
+onnx==1.17.0
+onnxscript==0.1.0
+onnxslim==0.1.96
+
+# A/B baseline for the recognizer.
+easyocr==1.7.2

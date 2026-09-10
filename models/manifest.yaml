@@ -1,0 +1,43 @@
+models:
+  vehicle:
+    artifact: models/vehicle/yolov8n_640.onnx
+    source_weights: yolov8n.pt
+    input_size:
+    - 640
+    - 640
+    sha256: 41d2d43051fbb5e815bbb0a4fc78df36bac59e9ac14dfd5401c883a74f9d84fc
+    size_bytes: 12756342
+    exported_at: '2026-08-30T10:32:37+00:00'
+    io:
+      inputs:
+        images:
+        - 1
+        - 3
+        - 640
+        - 640
+      outputs:
+        output0:
+        - 1
+        - 84
+        - 8400
+  plate:
+    artifact: models/plate/license-plate-finetune-v1l_320.onnx
+    source_weights: license-plate-finetune-v1l.pt
+    input_size:
+    - 320
+    - 320
+    sha256: a2d11abbfe8c0a1c52aaefb0d5a236625f19c50cb36c4f5538204a88ab207d31
+    size_bytes: 101269185
+    exported_at: '2026-08-30T08:38:21+00:00'
+    io:
+      inputs:
+        images:
+        - 1
+        - 3
+        - 320
+        - 320
+      outputs:
+        output0:
+        - 1
+        - 5
+        - 2100

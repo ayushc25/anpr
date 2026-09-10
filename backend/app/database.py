@@ -1,17 +1,11 @@
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
+"""Compatibility shim.
 
-from .config import DATABASE_URL
+The engine, session factory and declarative Base now live in ``app.db``. This
+module re-exports them so the prototype's routers and seed script keep working
+while they are migrated. New code should import from ``app.db.session`` and
+``app.db.base`` directly.
+"""
+from .db.base import Base
+from .db.session import SessionLocal, engine, get_db
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-Base = declarative_base()
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+__all__ = ["Base", "SessionLocal", "engine", "get_db"]

@@ -16,10 +16,20 @@ def _serialize(e: models.Event) -> schemas.EventOut:
     return schemas.EventOut(
         id=e.id, plate_number=e.plate_number, vehicle_id=e.vehicle_id, camera_id=e.camera_id,
         vehicle_type=e.vehicle_type, vehicle_color=e.vehicle_color, plate_color=e.plate_color,
-        direction=e.direction, status=e.status, confidence=e.confidence,
-        ocr_confidence=e.ocr_confidence, image_path=e.image_path, detected_at=e.detected_at,
+        direction=e.direction, status=e.status,
+        # The columns were renamed in the Phase 1 schema (confidence ->
+        # detect_confidence, ocr_confidence -> plate_confidence, image_path ->
+        # vehicle_image_path). The RESPONSE field names are kept as-is so the
+        # existing frontend is unaffected; only the mapping moved.
+        confidence=e.detect_confidence or 0.0,
+        ocr_confidence=e.plate_confidence or 0.0,
+        image_path=e.vehicle_image_path, detected_at=e.detected_at,
         camera_name=e.camera.name if e.camera else None,
-        owner_name=e.vehicle.owner_name if e.vehicle else None,
+        # display_owner falls back to the linked resident: once residents
+        # were split out of the vehicles table, owner_name is empty on any
+        # vehicle registered to one, so reading it directly showed a blank
+        # owner for every properly-registered vehicle.
+        owner_name=e.vehicle.display_owner if e.vehicle else None,
     )
 
 
@@ -53,9 +63,9 @@ def list_events(
 @router.get("/{event_id}/image")
 def get_event_image(event_id: int, db: Session = Depends(get_db), _: models.User = Depends(get_current_user)):
     e = db.query(models.Event).get(event_id)
-    if not e or not e.image_path:
+    if not e or not e.vehicle_image_path:
         raise HTTPException(status_code=404, detail="Image not found")
-    path = STORAGE_DIR / e.image_path
+    path = STORAGE_DIR / e.vehicle_image_path
     if not path.exists():
         raise HTTPException(status_code=404, detail="Image file missing")
     return FileResponse(path)
