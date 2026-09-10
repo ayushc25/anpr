@@ -52,3 +52,6 @@ artifacts/
 models/*/
 !models/manifest.yaml
 .cache/
+
+# Project documents (PDFs)
+*.pdf
