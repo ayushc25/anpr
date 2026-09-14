@@ -2,7 +2,7 @@
 
 On-premises, **CPU-only** ANPR for a society entry/exit gate over standard RTSP IP cameras.
 
-Design of record: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · Phasing: [docs/ROADMAP.md](docs/ROADMAP.md)
+Design of record: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · Phasing: [docs/ROADMAP.md](docs/ROADMAP.md) · Status & Gap Analysis: [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md)
 
 ## Stack
 
