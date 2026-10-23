@@ -172,7 +172,9 @@ class VehicleOut(VehicleBase):
 class EventOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
-    plate_number: str
+    #: None for a vehicle the system saw but could not name (result B with no
+    #: usable string, or C). The UI shows these as "no plate" rather than as text.
+    plate_number: Optional[str] = None
     vehicle_id: Optional[int] = None
     camera_id: Optional[int] = None
     vehicle_type: str
@@ -190,6 +192,9 @@ class EventOut(BaseModel):
     detected_at: UtcDatetime
     camera_name: Optional[str] = None
     owner_name: Optional[str] = None
+    #: A auto-accepted / B human review / C no plate visible.
+    result_class: Optional[str] = None
+    result_reason: Optional[str] = None
 
 
 class EventCreate(BaseModel):

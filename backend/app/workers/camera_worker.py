@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import signal
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 import cv2
@@ -26,7 +26,8 @@ from ..ai.registry import build_plate_detector, build_plate_recognizer, build_tr
 from ..debug.recorder import DebugConfig, DebugRecorder, NullRecorder
 from ..events.dedupe import DedupeConfig, EventDeduplicator
 from ..events.event_builder import EventBuilder
-from ..events.multi_frame_validator import MultiFrameValidator, SnapshotRegistry, ValidationConfig
+from ..events.multi_frame_validator import FinalPlate, MultiFrameValidator, SnapshotRegistry, ValidationConfig
+from ..events.result_class import ResultInfo
 from ..video.frame_processor import FrameProcessor, PipelineConfig
 from ..video.line_crossing import CrossDirection, VirtualLine
 from ..video.roi import RoiPolygon
@@ -90,6 +91,10 @@ class WorkerHealth:
     #: Debug recorder state, so an operator can see it is on and how much it
     #: has written. Empty when disabled.
     debug: dict = field(default_factory=dict)
+    #: Deferred-VLM state: vehicles awaiting the model, and the A/B/C tallies.
+    #: Empty in inline mode. A growing ``pending`` with a flat ``class_*`` is
+    #: the signature of a VLM service that is down or too slow for the box.
+    vlm: dict = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         return {
@@ -109,6 +114,7 @@ class WorkerHealth:
             "avg_stage_ms": {k: round(v, 2) for k, v in self.avg_stage_ms.items()},
             "last_error": self.last_error,
             "debug": self.debug,
+            "vlm": self.vlm,
         }
 
 
@@ -127,6 +133,8 @@ class CameraWorker:
         reader_kwargs: dict | None = None,
         debug_cfg: DebugConfig | None = None,
         debug_root=None,
+        vlm_cfg=None,
+        vlm_client=None,
     ):
         self.camera = camera
         self.ingest = ingest
@@ -149,12 +157,22 @@ class CameraWorker:
         self.detector = build_vehicle_detector(model_cfgs["vehicle_detector"], threads, cache_dir)
         self.tracker = build_tracker(model_cfgs["tracker"])
         self.plate_detector = build_plate_detector(model_cfgs["plate_detector"], threads, cache_dir)
-        self.recognizer = build_plate_recognizer(model_cfgs["plate_recognizer"], threads, cache_dir)
+
+        # In deferred mode this process loads NO recognizer: the one shared VLM
+        # service owns the only copy of that model. Loading it here would cost
+        # ~2 GB per camera and is the thing the service exists to prevent.
+        self.deferred = pipeline_cfg.recognition_mode == "deferred_vlm"
+        self.recognizer = (
+            None if self.deferred
+            else build_plate_recognizer(model_cfgs["plate_recognizer"], threads, cache_dir)
+        )
 
         # Warm up before the first vehicle arrives: on the OpenVINO EP the
         # first inference pays for graph compilation, which would otherwise
         # land on a real plate.
         for component in (self.detector, self.plate_detector, self.recognizer):
+            if component is None:
+                continue
             latency = component.warmup(2)
             logger.info("camera %s: %s warm-up %.1f ms", camera.code, component.name, latency)
 
@@ -170,9 +188,35 @@ class CameraWorker:
             read_zone=RoiPolygon.from_config(camera.read_zone, name="read_zone"),
             recorder=self.recorder,
         )
+        if self.deferred:
+            # A vehicle the validator cannot settle must reach the review
+            # queue as class B, not vanish: "drop low confidence" is the
+            # inline pipeline's policy, and deferred mode replaces it with the
+            # A/B/C classification.
+            validation_cfg = replace(validation_cfg, drop_low_confidence=False)
         self.validator = MultiFrameValidator(validation_cfg, registry)
         self.dedupe = EventDeduplicator(dedupe_cfg)
         self.builder = EventBuilder(camera_id=camera.id)
+
+        self.finalizer = None
+        self._vlm_client = None
+        if self.deferred:
+            from ..vlm.config import VlmConfig
+            from .deferred import DeferredFinalizer
+
+            vlm_cfg = vlm_cfg or VlmConfig()
+            self._vlm_cfg = vlm_cfg
+            self._vlm_client = vlm_client
+            if self._vlm_client is None:
+                raise ValueError("deferred_vlm mode needs a VLM client")
+            self.finalizer = DeferredFinalizer(
+                camera_id=camera.id,
+                client=self._vlm_client,
+                validator=self.validator,
+                cfg=vlm_cfg,
+                grammar_cfg=pipeline_cfg.grammar_decode,
+                on_result=self._emit_result,
+            )
 
         self.reader = RtspReader(camera.stream_url, name=camera.code, **(reader_kwargs or {}))
         self._frame_interval = 1.0 / max(0.5, camera.processing_fps)
@@ -199,6 +243,10 @@ class CameraWorker:
                 next_frame_at = now + self._frame_interval
 
                 self._sync_health()
+                if self.finalizer is not None:
+                    # Every iteration, frame or not: a vehicle's result must
+                    # not wait for the next frame to arrive.
+                    self.finalizer.poll()
                 frame, captured_at = self.reader.latest_with_timestamp()
                 if frame is None:
                     # No new frame: the stream is stalled or slower than our
@@ -229,7 +277,10 @@ class CameraWorker:
         self._record_timing(result.stats)
 
         for state in result.finalized:
-            self._finalize(state, wall)
+            if self.finalizer is not None:
+                self.finalizer.begin(state, wall)
+            else:
+                self._finalize(state, wall)
 
         if self._preview_wanted:
             self._render_preview(frame, result.tracks)
@@ -244,12 +295,7 @@ class CameraWorker:
         if final is None:
             return
 
-        direction = state.direction
-        if direction == CrossDirection.NONE:
-            # No line configured, or the track never crossed it: fall back to
-            # the camera's declared role so the event is still usable.
-            declared = self.camera.direction
-            direction = CrossDirection(declared) if declared in ("in", "out") else CrossDirection.NONE
+        direction = self._resolve_direction(state)
 
         if not self.dedupe.check_and_record(final.text, direction, wall):
             self.health.events_suppressed += 1
@@ -257,7 +303,20 @@ class CameraWorker:
             return
 
         draft = self.builder.build(state, final, direction)
-        if self.recorder.enabled:
+        self._publish(state, final, draft)
+
+    # -- emission shared by the inline and deferred paths ------------------
+    def _resolve_direction(self, state) -> CrossDirection:
+        direction = state.direction
+        if direction == CrossDirection.NONE:
+            # No line configured, or the track never crossed it: fall back to
+            # the camera's declared role so the event is still usable.
+            declared = self.camera.direction
+            direction = CrossDirection(declared) if declared in ("in", "out") else CrossDirection.NONE
+        return direction
+
+    def _publish(self, state, final, draft) -> None:
+        if self.recorder.enabled and final is not None:
             # The final verdict, filed next to the frames that produced it —
             # so an error can be traced from the resolved plate back to the
             # exact crop and per-character probabilities behind it.
@@ -299,14 +358,40 @@ class CameraWorker:
             })
         self.ingest.submit(draft)
         self.health.events_emitted += 1
+        if final is None:
+            logger.info(
+                "camera %s: class %s (no plate) reason=%s %s track=%s",
+                self.camera.code, draft.result_class, draft.result_reason,
+                draft.direction, state.track_id,
+            )
+            return
         logger.info(
-            "camera %s: %s %s conf=%.2f support=%.2f reads=%d (%s) "
+            "camera %s: %s %s class=%s conf=%.2f support=%.2f reads=%d (%s) "
             "media=%s vehicle@f%d plate@f%d win=[%.1f..%.1f] track=%s",
-            self.camera.code, final.text, draft.direction, final.confidence,
-            final.support, final.read_count, state.finalize_reason,
+            self.camera.code, final.text, draft.direction, draft.result_class,
+            final.confidence, final.support, final.read_count, state.finalize_reason,
             draft.media_source, draft.vehicle_image_frame, draft.plate_image_frame,
             draft.winning_window[0], draft.winning_window[1], state.track_id,
         )
+
+    def _emit_result(
+        self, state, final: Optional[FinalPlate], result: ResultInfo, review_crops: list, wall: float
+    ) -> None:
+        """Deferred path: a vehicle's A/B/C result has arrived.
+
+        Called by the DeferredFinalizer, possibly many seconds after the track
+        was finalized. ``final`` is None when there is no plate string (class
+        C, or a class B the system could not read at all).
+        """
+        direction = self._resolve_direction(state)
+        if final is not None and not self.dedupe.check_and_record(final.text, direction, wall):
+            self.health.events_suppressed += 1
+            logger.debug("camera %s: suppressed duplicate %s", self.camera.code, final.text)
+            return
+        draft = self.builder.build(
+            state, final, direction, result=result, review_crops=review_crops
+        )
+        self._publish(state, final, draft)
 
     # -- preview -----------------------------------------------------------
     def set_preview_enabled(self, enabled: bool) -> None:
@@ -358,6 +443,9 @@ class CameraWorker:
         self.health.last_frame_at = stats.last_frame_at
         self.health.reconnects = stats.reconnects
         self.health.spool_depth = self.ingest.spool_depth
+        if self.finalizer is not None:
+            self.health.vlm.update(self.finalizer.stats.as_dict())
+            self.health.vlm.update(pending=self.finalizer.pending_count, queue_depth=self._vlm_client.depth)
         if stats.last_error:
             self.health.last_error = stats.last_error
 
@@ -370,9 +458,21 @@ class CameraWorker:
         wall = time.time()
         for state in self.processor.flush():
             try:
-                self._finalize(state, wall)
+                if self.finalizer is not None:
+                    self.finalizer.begin(state, wall)
+                else:
+                    self._finalize(state, wall)
             except Exception:
                 logger.exception("camera %s: flush failed", self.camera.code)
+
+        if self.finalizer is not None:
+            # Vehicles still waiting on the VLM get a bounded grace period,
+            # then go out as class B rather than being lost with the process.
+            try:
+                self.finalizer.drain(self._vlm_cfg.shutdown_wait_s)
+            except Exception:
+                logger.exception("camera %s: draining the VLM queue failed", self.camera.code)
+            self._vlm_client.close()
 
         self.ingest.close()
         self.processor.close()

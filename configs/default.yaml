@@ -2,6 +2,19 @@
 # and in the cameras table; the database wins over both at runtime.
 
 pipeline:
+  # Where plates are read.
+  #   deferred_vlm  no recognition in the frame loop. Plate observations are
+  #                 collected as always; when a vehicle's track is finalized the
+  #                 best few crops go to the ONE shared Qwen-VL service (see the
+  #                 `vlm:` block below) and the result arrives seconds later as
+  #                 an A / B / C outcome. Results are delayed by design.
+  #   inline        the original cascade: a CTC recognizer (models.yaml
+  #                 plate_recognizer) reads on the frame that produced the crop.
+  #                 One-line fallback if the VLM service cannot run on a box.
+  recognition_mode: deferred_vlm
+  # Plate observations a track retains in deferred mode, so the selector has a
+  # pool to choose its best K from. Keep >= vlm.best_k.
+  deferred_keep_observations: 8
   processing_fps: 6.0        # frames per second actually put through the cascade
   detect_interval: 2         # vehicle detector on 1-in-N processed frames
   plate_interval: 2          # frames between plate attempts per track
@@ -10,11 +23,20 @@ pipeline:
   min_roi_overlap: 0.30
   min_plate_quality: 0.35
   plate_crop_pad: 0.06
+  # Margin for deferred_vlm mode only. The detector's box often clips the first
+  # or last character (seen in saved crops); the VLM reads a plate with margin
+  # far better than a CTC head does. inline mode keeps plate_crop_pad above.
+  deferred_plate_crop_pad: 0.15
   roi_crop_pad: 0.05
   skip_classes: ["bicycle"]
   max_track_seconds: 45.0
   use_quad_warp: true
-  enhance_before_ocr: true
+  # Off for ppocr_onnx: on 201 labelled site crops the raw crop read 68.2%
+  # exact against 65.2% after upscale+CLAHE (and 62.7% with the vision_sense
+  # denoise+sharpen chain on top). The recognizer does its own resize to 48 px
+  # height; pre-upscaling only adds interpolation. Turn back on for
+  # easyocr_legacy, which benefits from it.
+  enhance_before_ocr: false
   lock_min_reads: 4
   lock_min_support: 0.90
 
@@ -318,6 +340,78 @@ debug:
   max_tracks: 50
   max_bytes: 500000000
   jpeg_quality: 92
+
+# --- deferred VLM -----------------------------------------------------------
+# Only consulted when pipeline.recognition_mode is deferred_vlm.
+#
+# One model for the whole application. The supervisor starts the service
+# (`anpr vlm-service`) and subtracts its threads from the camera workers'
+# budget; camera workers connect to it and load no model of their own.
+vlm:
+  # socket: the shared service (production, any number of cameras)
+  # local:  load the model inside the camera worker (dev box, ONE camera only)
+  mode: socket
+  host: 127.0.0.1
+  port: 8765
+  # Interpreter the supervisor starts the service with. onnxruntime-genai needs
+  # a much newer onnxruntime than the detectors' pinned one and cannot share a
+  # venv with it: create backend/venv-vlm from backend/requirements-vlm.txt and
+  # point this at it. Empty = the supervisor's own interpreter (only works if
+  # that environment has onnxruntime-genai).
+  python: backend/venv-vlm/Scripts/python.exe
+  # 0 = half the physical cores (at least 1). The camera workers get the rest.
+  threads: 0
+
+  # --- bounded queues: overload is VISIBLE, never a silent drop ---------------
+  # Service-side bound. A job arriving at a full queue is refused at once.
+  queue_size: 8
+  # Per-camera bound on jobs submitted and not yet answered. A vehicle that
+  # cannot be submitted becomes a class B result (vlm_queue_overflow) with its
+  # best crops saved for a human.
+  client_pending: 6
+  # A job that waited this long in the service queue is discarded unrun.
+  max_job_age_s: 90
+  # A camera gives up on a job after this and emits class B (vlm_timeout).
+  # Generous on purpose: tens of seconds of latency is accepted. This only
+  # bounds a hung service.
+  job_timeout_s: 120
+  # On shutdown: how long to wait for in-flight vehicles before emitting them
+  # as class B.
+  shutdown_wait_s: 45
+
+  # --- best-frame selection ---------------------------------------------------
+  # Crops sent per vehicle (design range 5-7). Each is ~2 s of CPU.
+  best_k: 6
+  # Below this quality an observation is not usable. A vehicle with NO usable
+  # observation after crossing the read zone is class C ("no plate visible").
+  min_quality: 0.35
+  # 70 px = ocr.min_plate_width_read, the readable-size floor the inline pipeline
+  # uses. Narrower crops (~70x20) were unreadable and, queued, displaced
+  # vehicles that were readable.
+  min_width: 70
+  # The VLM is the bottleneck (~2-3 s per crop). Stop reading a vehicle's crops
+  # once this many agree exactly: a clear plate then costs 3 reads, not 6.
+  # 0 = always read every selected crop.
+  early_stop_agree: 3
+  # Two crops closer than this (appearance hash, of 64) are one view; chosen
+  # crops are also at least min_frame_gap processed frames apart.
+  min_hamming: 6
+  min_frame_gap: 2
+
+  # --- conditional verification -----------------------------------------------
+  # A second question to the VLM ("does this read exactly X?") for ambiguous
+  # results only: multiple variants, grammar corrections, unstable positions,
+  # an incomplete or low-quality plate, or a PROBABLE result.
+  # It can only DOWNGRADE A -> B. It never promotes anything.
+  verification:
+    enabled: true
+    crops: 1
+    reject_below: 0.5          # mean P(yes) under this = rejection
+    low_quality_below: 0.50
+    verify_probable: true      # advisory on B results: recorded, cannot change class
+    # A triggered A that could not be verified (queue full, service down):
+    #   downgrade -> becomes B (safe)    keep -> stays A
+    on_unavailable: downgrade
 
 # --- locale ----------------------------------------------------------------
 # Timestamps are STORED in UTC and that does not change — UTC is the only sane

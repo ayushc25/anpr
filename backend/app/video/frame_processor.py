@@ -91,6 +91,10 @@ def _quality_of(observation: PlateObservation) -> QualityBreakdown:
     )
 
 
+#: Public name for the rebuild above: the deferred finalizer needs it too.
+quality_of_observation = _quality_of
+
+
 def _count_decline(stats: FrameStats, reason: str) -> None:
     counter = _DECLINE_COUNTERS.get(reason)
     if counter is None:
@@ -155,6 +159,44 @@ class PipelineConfig:
     #: expensive stage in the cascade on it is the worst possible bet, and a
     #: track that vanishes after two frames was never a vehicle to read.
     min_track_age: int = 2
+    #: Where plates get read.
+    #:
+    #:   "inline"        the recognizer runs on the frame that produced the
+    #:                   crop, under the OCR scheduler's budget. The original
+    #:                   cascade, and the right one for a fast CTC recognizer.
+    #:   "deferred_vlm"  NO recognition happens in the frame loop. Plate
+    #:                   observations are collected exactly as before, and when
+    #:                   the track is finalized the worker selects the best few
+    #:                   and hands them to the shared VLM service. See
+    #:                   workers/deferred.py. The OCR scheduler, per-track OCR
+    #:                   budget and retry machinery are not used in this mode.
+    recognition_mode: str = "inline"
+    #: Observations retained per track in deferred mode, so the selector has
+    #: something to choose its best K from. Must be at least the selector's K;
+    #: the larger of this and ``ocr.keep_observations`` is what is kept.
+    deferred_keep_observations: int = 8
+    #: Plate CONTINUITY. A tracked box in dense traffic can cover several
+    #: vehicles, and picking "the most confident plate" each frame then
+    #: alternates between their plates, so one track collects a mixture of
+    #: different cars. Instead each frame prefers the plate NEAREST the one
+    #: seen last, within this many plate-widths, and a plate that is not near
+    #: (or that reappears after more than ``plate_continuity_frames`` frames)
+    #: starts a new chain. Chains are what the VLM crop selection chooses
+    #: between. Splitting a real chain in two only costs crops; merging two
+    #: vehicles costs the plate, so doubt resolves toward a new chain.
+    plate_continuity_ratio: float = 1.5
+    plate_continuity_frames: int = 8
+    #: Crop margin around the detected plate in deferred mode, per side, as a
+    #: fraction of the plate box. Larger than ``plate_crop_pad`` because the
+    #: detector emits only an axis-aligned box and its edge often falls inside
+    #: the first or last character; observed on real footage, where crops cut
+    #: off the final digit and the VLM faithfully read the truncated plate. A
+    #: VLM reads a plate with margin around it far better than a CTC head does,
+    #: and inline mode keeps the tighter pad it was measured with.
+    deferred_plate_crop_pad: float = 0.15
+
+
+RECOGNITION_MODES = ("inline", "deferred_vlm")
 
 
 @dataclass
@@ -190,7 +232,7 @@ class FrameProcessor:
         detector: VehicleDetector,
         tracker: VehicleTracker,
         plate_detector: PlateDetector,
-        recognizer: PlateRecognizer,
+        recognizer: Optional[PlateRecognizer],
         roi: RoiPolygon,
         line: Optional[VirtualLine] = None,
         cfg: PipelineConfig | None = None,
@@ -206,6 +248,20 @@ class FrameProcessor:
         self.line = line
         self.cfg = cfg or PipelineConfig()
         self.camera_id = camera_id
+
+        if self.cfg.recognition_mode not in RECOGNITION_MODES:
+            raise ValueError(
+                f"pipeline.recognition_mode={self.cfg.recognition_mode!r}; known: {list(RECOGNITION_MODES)}"
+            )
+        #: In deferred mode this process never recognizes a plate. The
+        #: recognizer is None there by design — loading a 2 GB model into every
+        #: camera process is exactly what the shared service exists to avoid.
+        self.deferred = self.cfg.recognition_mode == "deferred_vlm"
+        self._plate_pad = (
+            self.cfg.deferred_plate_crop_pad if self.deferred else self.cfg.plate_crop_pad
+        )
+        if recognizer is None and not self.deferred:
+            raise ValueError("an inline pipeline needs a recognizer")
 
         # The READ ZONE: the part of the ROI where a plate on THIS camera is
         # actually big enough to read. The ROI says where to look for
@@ -443,7 +499,7 @@ class FrameProcessor:
             return None
         stats.plates_detected += len(candidates)
 
-        candidate = _first_associated(candidates, track.bbox, frame.shape[:2], cfg.association)
+        candidate, chain = self._pick_candidate(candidates, track, state, frame.shape[:2])
         if candidate is None:
             stats.plates_rejected_geometry += 1
             state.note_ocr_wait("plate_not_on_vehicle")
@@ -452,7 +508,7 @@ class FrameProcessor:
         # Keeping both is what lets a debug dump answer "was the crop wrong,
         # or did the warp/enhancement break it?" — a question the pipeline
         # could not previously answer at all.
-        raw_crop = crop_box(frame, candidate.bbox, pad=self.cfg.plate_crop_pad)
+        raw_crop = crop_box(frame, candidate.bbox, pad=self._plate_pad)
         plate_crop = self._extract_plate(frame, candidate)
         if plate_crop is None:
             return None
@@ -469,10 +525,15 @@ class FrameProcessor:
             crop=plate_crop,
             raw_crop=raw_crop,
             appearance=crop_hash.crop_hash(plate_crop),
+            bbox=candidate.bbox,
+            group=chain,
         )
         state.note_observation(
             observation,
-            keep=cfg.ocr.keep_observations,
+            keep=(
+                max(cfg.ocr.keep_observations, cfg.deferred_keep_observations)
+                if self.deferred else cfg.ocr.keep_observations
+            ),
             growth_window=cfg.ocr.growth_window,
             min_distance=cfg.ocr.diversity_hamming,
         )
@@ -480,6 +541,11 @@ class FrameProcessor:
         # well: a sharp, large plate means a good view of the vehicle too.
         state.note_vehicle_crop(vehicle_crop, quality.score)
         stats.plates_observed += 1
+
+        if self.deferred:
+            # Observation recorded; nothing is read here. The vehicle's best
+            # crops go to the VLM service when its track is finalized.
+            return None
 
         verdict = decide(
             OcrContext(
@@ -511,6 +577,43 @@ class FrameProcessor:
             det_confidence=candidate.confidence,
             raw_crop=raw_crop,
         )
+
+    def _pick_candidate(self, candidates, track: Track, state: TrackState, frame_shape):
+        """The plate to follow on this track this frame, and its chain id.
+
+        Among the geometrically plausible candidates, the one NEAREST the
+        plate this track saw last wins (within ``plate_continuity_ratio``
+        plate-widths); otherwise the most confident one starts a new chain.
+        """
+        cfg = self.cfg
+        valid = [
+            c for c in candidates
+            if validate_association(c.bbox, track.bbox, frame_shape, cfg.association)
+        ]
+        if not valid:
+            return None, 0
+
+        previous = state.last_plate_bbox
+        recent = previous is not None and (self._frame_idx - state.last_plate_frame) <= cfg.plate_continuity_frames
+        chosen, same_chain = valid[0], False
+        if recent:
+            pcx, pcy = (previous[0] + previous[2]) / 2.0, (previous[1] + previous[3]) / 2.0
+            pw = previous[2] - previous[0]
+            nearest, nearest_d = None, None
+            for c in valid:
+                cx, cy = (c.bbox[0] + c.bbox[2]) / 2.0, (c.bbox[1] + c.bbox[3]) / 2.0
+                tolerance = cfg.plate_continuity_ratio * max(pw, c.bbox[2] - c.bbox[0])
+                distance = ((cx - pcx) ** 2 + (cy - pcy) ** 2) ** 0.5
+                if distance <= tolerance and (nearest_d is None or distance < nearest_d):
+                    nearest, nearest_d = c, distance
+            if nearest is not None:
+                chosen, same_chain = nearest, True
+
+        if not same_chain:
+            state.plate_group += 1
+        state.last_plate_bbox = chosen.bbox
+        state.last_plate_frame = self._frame_idx
+        return chosen, state.plate_group
 
     def _spend_ocr_budget(
         self, pending: list[_PlateWork], now: float, stats: FrameStats, timing: StageTiming
@@ -647,7 +750,7 @@ class FrameProcessor:
                 return warp_quad(frame, candidate.quad, (width, height))
             except Exception:
                 logger.debug("quad warp failed, falling back to axis-aligned crop", exc_info=True)
-        return crop_box(frame, candidate.bbox, pad=self.cfg.plate_crop_pad)
+        return crop_box(frame, candidate.bbox, pad=self._plate_pad)
 
     # -- finalization ------------------------------------------------------
     def _collect_finalized(
@@ -741,7 +844,7 @@ class FrameProcessor:
         known in advance and cannot depend on how long the vehicle dwelled.
         """
         policy = self.cfg.ocr
-        if policy.retry_bonus <= 0 or state.retry_resolved:
+        if self.deferred or policy.retry_bonus <= 0 or state.retry_resolved:
             return 0
         state.retry_resolved = True
 
@@ -824,6 +927,8 @@ class FrameProcessor:
 
     def close(self) -> None:
         for component in (self.detector, self.plate_detector, self.recognizer):
+            if component is None:
+                continue
             try:
                 component.close()
             except Exception:

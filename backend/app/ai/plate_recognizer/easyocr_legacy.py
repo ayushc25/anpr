@@ -17,6 +17,46 @@ from .base import PlateRecognizer
 
 ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
+#: Two boxes share a row when their vertical extents overlap by at least this
+#: fraction of the shorter box's height. Relative, not a pixel gap, because
+#: the crop arrives at whatever scale the plate was seen at.
+ROW_OVERLAP = 0.5
+
+
+def reading_order(results: list) -> list:
+    """Sort EasyOCR boxes into plate reading order: rows top-to-bottom, boxes
+    left-to-right within a row.
+
+    Sorting by (top, left) alone breaks a single-line plate that EasyOCR split
+    into two boxes: if the right-hand box's top edge sits a pixel higher, it
+    sorts first and "DL5CU" + "1624" comes out as "1624DL5CU". Grouping into
+    rows first keeps the stacked two-line plate working (its rows do not
+    overlap) and fixes the split single line.
+    """
+    boxes = []
+    for r in results:
+        ys = [p[1] for p in r[0]]
+        xs = [p[0] for p in r[0]]
+        boxes.append((min(ys), max(ys), min(xs), r))
+    boxes.sort(key=lambda b: (b[0] + b[1]) / 2.0)
+
+    rows: list[list[tuple]] = []
+    for box in boxes:
+        top, bottom = box[0], box[1]
+        for row in rows:
+            row_top = min(b[0] for b in row)
+            row_bottom = max(b[1] for b in row)
+            overlap = min(bottom, row_bottom) - max(top, row_top)
+            shorter = min(bottom - top, row_bottom - row_top)
+            if shorter > 0 and overlap >= ROW_OVERLAP * shorter:
+                row.append(box)
+                break
+        else:
+            rows.append([box])
+
+    rows.sort(key=lambda row: min(b[0] for b in row))
+    return [b[3] for row in rows for b in sorted(row, key=lambda b: b[2])]
+
 
 class EasyOcrRecognizer(PlateRecognizer):
     name = "easyocr_legacy"
@@ -49,9 +89,7 @@ class EasyOcrRecognizer(PlateRecognizer):
         )
         if not results:
             return None
-        # A plate crop can still yield two boxes on a stacked plate; join them
-        # top-to-bottom, which is the reading order of an Indian two-line plate.
-        results.sort(key=lambda r: (min(p[1] for p in r[0]), min(p[0] for p in r[0])))
+        results = reading_order(results)
         text = "".join(str(r[1]) for r in results)
         confidences = [float(r[2]) for r in results if r[2] is not None]
         confidence = float(np.mean(confidences)) if confidences else 0.0

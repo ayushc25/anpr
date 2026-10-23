@@ -18,6 +18,7 @@ import numpy as np
 
 from ..video.line_crossing import CrossDirection
 from .multi_frame_validator import FinalPlate
+from .result_class import ResultClass, ResultInfo, classify
 from .track_state import TrackState
 
 
@@ -38,7 +39,11 @@ class ReadEvidence:
 class EventDraft:
     event_uid: str
     camera_id: int
-    plate_number: str
+    #: None for a vehicle the system saw but could not name (class B with no
+    #: usable string, or class C). Never an empty string and never a placeholder
+    #: like "UNKNOWN": a fake plate is a row that matches the wrong thing in a
+    #: search, a registry lookup or an alert rule.
+    plate_number: Optional[str]
     plate_raw: str
     direction: str
     vehicle_type: str
@@ -74,6 +79,20 @@ class EventDraft:
     disputed: bool = False
     duration_seconds: float = 0.0
     reads: list[ReadEvidence] = field(default_factory=list)
+
+    # -- A / B / C outcome -------------------------------------------------
+    #: "A" auto-accepted, "B" human review, "C" no plate visible. Empty on a
+    #: draft spooled before this field existed; ingest derives it from
+    #: ``recognition_state`` in that case.
+    result_class: str = ""
+    #: Why — a short machine-readable reason ("vlm_queue_overflow",
+    #: "verification_rejected", "no_usable_plate_observation", ...).
+    result_reason: str = ""
+    #: The verification pass's verdict, when one ran.
+    verification: dict = field(default_factory=dict)
+    #: Extra base64 JPEGs of the best plate crops, saved so a reviewer can see
+    #: what the system had to work with. Populated for B and C results.
+    review_crops_b64: list[str] = field(default_factory=list)
 
     #: base64 JPEGs. Carried inline so a spooled draft is self-contained;
     #: the API decodes them to the media store on ingest.
@@ -119,6 +138,15 @@ def _encode(image: Optional[np.ndarray], quality: int = 85) -> Optional[str]:
     return base64.b64encode(buffer.tobytes()).decode("ascii")
 
 
+def _encode_many(images: Optional[list[np.ndarray]]) -> list[str]:
+    out = []
+    for image in images or []:
+        encoded = _encode(image, quality=92)
+        if encoded:
+            out.append(encoded)
+    return out
+
+
 def decode_image(encoded: Optional[str]) -> Optional[bytes]:
     return base64.b64decode(encoded) if encoded else None
 
@@ -132,12 +160,18 @@ class EventBuilder:
     def build(
         self,
         state: TrackState,
-        final: FinalPlate,
+        final: Optional[FinalPlate],
         direction: CrossDirection | None = None,
         detected_at: datetime | None = None,
+        result: Optional[ResultInfo] = None,
+        review_crops: Optional[list[np.ndarray]] = None,
     ) -> EventDraft:
+        """``final`` is None for a vehicle with no plate string (class B
+        overload / unreadable, or class C); ``result`` then says which."""
         resolved_direction = direction or state.direction
         when = detected_at or datetime.now(timezone.utc)
+        if result is None:
+            result = classify(final)
 
         evidence: list[ReadEvidence] = []
         if self.keep_read_evidence:
@@ -156,6 +190,11 @@ class EventBuilder:
                     )
                 )
             evidence.sort(key=lambda r: r.frame_ts)
+
+        if final is None:
+            return self._build_without_plate(
+                state, resolved_direction, when, evidence, result, review_crops
+            )
 
         return EventDraft(
             event_uid=str(uuid.uuid4()),
@@ -186,10 +225,62 @@ class EventBuilder:
             # Anything the validator did not settle wants a human eye. The
             # validator already marks the state disputed for those, so this
             # stays the single source of truth rather than a second rule.
-            disputed=state.disputed,
+            disputed=state.disputed or result.result_class is not ResultClass.AUTO_ACCEPTED,
             duration_seconds=round(state.duration, 2),
             reads=evidence,
+            result_class=result.value,
+            result_reason=result.reason,
+            verification=dict(final.verification or {}),
+            review_crops_b64=_encode_many(review_crops) if result.result_class is not ResultClass.AUTO_ACCEPTED else [],
             **_media_fields(state, final.text),
+        )
+
+    def _build_without_plate(
+        self,
+        state: TrackState,
+        direction,
+        when: datetime,
+        evidence: list[ReadEvidence],
+        result: ResultInfo,
+        review_crops: Optional[list[np.ndarray]],
+    ) -> EventDraft:
+        """A vehicle was here and there is no plate string to report.
+
+        Everything numeric about the plate is zero because there is no plate;
+        ``recognition_state`` is "unresolved", the honest statement of "the
+        system did not identify it". The images are the track's best crops,
+        and ``media_source`` says they are a best-effort pairing, since there
+        is no winning string for them to be paired with.
+        """
+        return EventDraft(
+            event_uid=str(uuid.uuid4()),
+            camera_id=self.camera_id,
+            plate_number=None,
+            plate_raw="",
+            direction=_direction_value(direction),
+            vehicle_type=state.vehicle_type,
+            vehicle_color=state.vehicle_color,
+            plate_color=state.plate_color,
+            detected_at=when.isoformat(),
+            plate_confidence=0.0,
+            detect_confidence=round(state.detect_confidence, 4),
+            validation_support=0.0,
+            read_count=len(state.reads),
+            distinct_variants=state.distinct_texts,
+            grammar_valid=False,
+            recognition_state="unresolved",
+            track_id=state.track_id,
+            finalize_reason=state.finalize_reason,
+            disputed=True,
+            duration_seconds=round(state.duration, 2),
+            reads=evidence,
+            result_class=result.value,
+            result_reason=result.reason,
+            verification=dict(result.detail.get("verification", {})) if result.detail else {},
+            review_crops_b64=_encode_many(review_crops),
+            vehicle_image_b64=_encode(state.best_vehicle_crop),
+            plate_image_b64=_encode(state.best_plate_crop, quality=92),
+            media_source="best_observation",
         )
 
 

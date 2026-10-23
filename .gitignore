@@ -58,3 +58,6 @@ models/*/
 
 # Documentation
 docs/
+
+# VLM service environment
+backend/venv-vlm/

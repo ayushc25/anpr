@@ -6,7 +6,7 @@ of wheels off the edge box and removes a large class of startup cost.
 
     python scripts/export_onnx.py --all
     python scripts/export_onnx.py --vehicle yolo26n.pt --imgsz 640
-    python scripts/export_onnx.py --plate license-plate-finetune-v1l.pt --imgsz 320
+    python scripts/export_onnx.py --plate license-plate-nano.pt --imgsz 320
 
 Writes to models/<stage>/ and updates models/manifest.yaml with sha256 sums,
 which the worker verifies at startup so a half-copied artifact fails loudly
@@ -127,7 +127,7 @@ def main() -> int:
     jobs: list[tuple[str, Path, int]] = []
     if args.all:
         jobs.append(("vehicle", ROOT / "yolo26n.pt", args.imgsz or args.vehicle_imgsz))
-        jobs.append(("plate", ROOT / "license-plate-finetune-v1l.pt", args.imgsz or args.plate_imgsz))
+        jobs.append(("plate", ROOT / "license-plate-nano.pt", args.imgsz or args.plate_imgsz))
     if args.vehicle:
         jobs.append(("vehicle", args.vehicle, args.imgsz or args.vehicle_imgsz))
     if args.plate:

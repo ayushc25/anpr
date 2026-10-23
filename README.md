@@ -9,7 +9,7 @@ Design of record: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · Phasing: [docs
 | | |
 |---|---|
 | **Serving inference** | ONNX Runtime (OpenVINO EP on Intel). No torch, no CUDA, no TensorRT. |
-| **Pipeline** | YOLO vehicle detector → ByteTrack → plate detector → CTC recognizer → multi-frame validation |
+| **Pipeline** | YOLO vehicle detector → ByteTrack → plate detector → best-frame selection → **Qwen3-VL-2B INT4 (shared service)** → multi-frame fusion → grammar validation → conditional verification → **A / B / C** result. (`recognition_mode: inline` keeps the older CTC-recognizer cascade.) |
 | **Backend** | Python, FastAPI, SQLAlchemy, Alembic, PostgreSQL |
 | **Frontend** | React (Vite), Tailwind, Recharts |
 
@@ -20,7 +20,8 @@ backend/app/
   ai/          pure inference library — no DB, no FastAPI (see docs/ARCHITECTURE.md §B)
   video/       RTSP reader, ROI, virtual lines, the frame cascade
   events/      track state, multi-frame validator, dedupe, rules engine
-  workers/     camera worker (one process per camera) + supervisor
+  workers/     camera worker (one process per camera) + supervisor + deferred finalizer
+  vlm/         the shared Qwen-VL service: protocol, bounded client/server
   repositories/  all SQL      services/  use-cases      api/v1/  endpoints
   alembic/     schema migrations
 configs/       default.yaml (tuning) · models.yaml (which model per stage)
@@ -42,7 +43,13 @@ venv\Scripts\python -m alembic upgrade head
 # 2. models: export the detectors from the .pt weights in the repo root
 cd .. && backend\venv\Scripts\python scripts\export_onnx.py --all
 
-# 3. recognizer (optional but recommended — otherwise EasyOCR is used)
+# 3. VLM recognizer (the default pipeline.recognition_mode: deferred_vlm).
+#    Separate venv: onnxruntime-genai needs a newer onnxruntime than the detectors' pin.
+python -m venv backend\venv-vlm
+backend\venv-vlm\Scripts\pip install -r backend\requirements-vlm.txt
+backend\venv-vlm\Scripts\python scripts\fetch_vlm.py          # ~1.4 GB
+
+# 3b. Optional, only for recognition_mode: inline (or as a benchmark baseline)
 backend\venv\Scripts\python scripts\fetch_recognizer.py --ppocr
 
 # 4. verify
@@ -60,6 +67,10 @@ backend\venv\Scripts\python -m uvicorn backend.app.main:app --port 8002
 
 # Camera workers (spawns and supervises one process per enabled camera)
 backend\venv\Scripts\python -m backend.app.cli supervisor
+
+# The shared VLM service on its own (the supervisor starts it for you when
+# recognition_mode is deferred_vlm; run it by hand only to put it on another box)
+backend\venv-vlm\Scripts\python -m backend.app.cli vlm-service
 
 # One camera in the foreground, logging events instead of storing them —
 # the right way to tune a camera's ROI and thresholds on site

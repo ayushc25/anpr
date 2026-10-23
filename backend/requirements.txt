@@ -31,6 +31,11 @@ onnxruntime==1.20.1
 scipy==1.14.1          # Hungarian assignment in the tracker (greedy fallback if absent)
 psutil==6.1.0          # physical core count for the thread budget
 
+# NOTE: the deferred-VLM service (Qwen3-VL via onnxruntime-genai) is NOT installed
+# here. onnxruntime-genai needs a much newer onnxruntime than the 1.20.1 pinned
+# above, and the two cannot share an interpreter, so the service has its own
+# environment: see requirements-vlm.txt.
+
 # --- optional ----------------------------------------------------------
 # OpenVINO Execution Provider: ~25-45% faster on Intel CPUs. Install INSTEAD
 # of onnxruntime above (they conflict), then set backend: openvino or auto.

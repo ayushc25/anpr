@@ -1,12 +1,12 @@
-"""Download a pretrained recognition head and its charset.
+"""Download a pretrained recognition head and its dictionary.
 
 The detectors are exported from weights already in this repo; the recognizer
 is not, so it is fetched. Run once per install:
 
     python scripts/fetch_recognizer.py --ppocr
 
-Then swap `plate_recognizer.impl` to `ppocr_onnx` in configs/models.yaml.
-Verify with `python -m backend.app.cli models check`.
+configs/models.yaml already points `plate_recognizer` at the files this
+writes. Verify with `python -m backend.app.cli models check`.
 
 This is a Phase 1 stopgap. The Phase 2 recognizer is an LPRNet/CRNN fine-tuned
 on plates harvested from this site (scripts/harvest_dataset.py), which is what
@@ -15,6 +15,7 @@ takes accuracy from ~88% to ~96% on Indian plates.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 import urllib.request
 from pathlib import Path
@@ -22,16 +23,34 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 OUT_DIR = ROOT / "models" / "recognizer"
 
-# PP-OCRv4 English mobile recognition head, already converted to ONNX.
-# Pinned by URL rather than vendored: the artifact is ~10 MB and does not
-# belong in git.
-PPOCR_URL = "https://huggingface.co/OleehyO/paddleocr-onnx/resolve/main/en_PP-OCRv4_rec_infer.onnx"
+# PP-OCRv4 English mobile recognition head, already converted to ONNX, and the
+# dictionary it was trained with. Pinned by URL and sha256 rather than vendored:
+# the artifact is ~8 MB and does not belong in git. (The OleehyO/paddleocr-onnx
+# URL this used to point at now returns 401.)
+_HF = "https://huggingface.co/deepghs/paddleocr/resolve/main/rec/en_PP-OCRv4_rec"
+PPOCR_MODEL = (f"{_HF}/model.onnx", "ppocr_rec_en.onnx",
+               "870d81b658bb0ba59ae4a2aecf21f879e4921002be29d208cdcdb977af6e0959")
+# The MODEL's dictionary: 95 printable-ASCII characters, in the order the
+# output classes are numbered. It is not the plate alphabet and must not be
+# replaced by one — see the note at the top of ppocr_onnx.py. Identical to
+# PaddleOCR's ppocr/utils/en_dict.txt.
+PPOCR_DICT = (f"{_HF}/dict.txt", "ppocr_en_dict.txt",
+              "5662df9d2d03f0e8ca0d3b0649d6acbab904b6a14b3d3521463c71c37c668ce3")
 
-# 0-9 A-Z, one per line, blank implied at index 0 by the CTC decoder.
+# 0-9 A-Z, one per line: the plate alphabet, for recognizers trained on
+# exactly that (LPRNet). Blank implied at index 0 by the CTC decoder.
 CHARSET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 
-def download(url: str, target: Path) -> bool:
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def download(url: str, target: Path, expected_sha256: str | None = None) -> bool:
     target.parent.mkdir(parents=True, exist_ok=True)
     print(f"  fetching {url}")
     try:
@@ -40,6 +59,13 @@ def download(url: str, target: Path) -> bool:
                 handle.write(chunk)
     except Exception as exc:
         print(f"  ! download failed: {exc}", file=sys.stderr)
+        target.unlink(missing_ok=True)
+        return False
+    if expected_sha256 and _sha256(target) != expected_sha256:
+        # A moved or replaced artifact must not be served silently: a
+        # different model with the same dictionary is exactly the failure
+        # that produces confident garbage.
+        print(f"  ! checksum mismatch for {target.name}; removed", file=sys.stderr)
         target.unlink(missing_ok=True)
         return False
     print(f"  -> {target.relative_to(ROOT)} ({target.stat().st_size / 1e6:.1f} MB)")
@@ -66,18 +92,21 @@ def main() -> int:
         return 1
 
     write_charset()
-    ok = download(args.url or PPOCR_URL, OUT_DIR / args.name)
+    if args.url:
+        ok = download(args.url, OUT_DIR / args.name)
+    else:
+        ok = all(download(url, OUT_DIR / name, digest) for url, name, digest in (PPOCR_MODEL, PPOCR_DICT))
     if not ok:
         print(
-            "\nNo network, or the URL moved. The pipeline still runs on the\n"
-            "easyocr_legacy recognizer configured in configs/models.yaml —\n"
-            "slower, but functional. Drop any CTC recognition ONNX into\n"
-            f"{OUT_DIR.relative_to(ROOT)} and point models.yaml at it.",
+            "\nNo network, or the URL moved. Set plate_recognizer.impl back to\n"
+            "easyocr_legacy in configs/models.yaml to keep running — slower,\n"
+            "but functional. Or drop a CTC recognition ONNX and ITS OWN\n"
+            f"dictionary into {OUT_DIR.relative_to(ROOT)} and point models.yaml at them.",
             file=sys.stderr,
         )
         return 1
 
-    print("\nNow set plate_recognizer.impl: ppocr_onnx in configs/models.yaml, then:")
+    print("\nDone. Verify with:")
     print("  python -m backend.app.cli models check")
     return 0
 

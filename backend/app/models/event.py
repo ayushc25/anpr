@@ -22,7 +22,10 @@ class Event(Base):
     event_uid = Column(String(36), unique=True, index=True, nullable=True)
 
     camera_id = Column(Integer, ForeignKey("cameras.id"), nullable=True, index=True)
-    plate_number = Column(String(32), index=True, nullable=False)
+    #: NULL for a vehicle the system saw but could not name: a class B result
+    #: with no usable plate string, or a class C (no plate visible). Not "" and
+    #: not a placeholder - see EventDraft.plate_number.
+    plate_number = Column(String(32), index=True, nullable=True)
     plate_raw = Column(String(48), default="")
 
     vehicle_id = Column(Integer, ForeignKey("vehicles.id"), nullable=True, index=True)
@@ -48,6 +51,18 @@ class Event(Base):
     vehicle_image_path = Column(String(512), nullable=True)
     plate_image_path = Column(String(512), nullable=True)
     snapshot_path = Column(String(512), nullable=True)
+
+    #: A auto-accepted / B human review / C no plate visible. Indexed because
+    #: "show me everything waiting for review" is the query the review queue
+    #: runs. NULL on rows that predate the column.
+    result_class = Column(String(1), nullable=True, index=True)
+    #: Why the result landed where it did ("vlm_queue_overflow",
+    #: "verification_rejected", "no_usable_plate_observation", ...).
+    result_reason = Column(String(48), nullable=True)
+    #: Audit detail: the verification verdict, when one ran.
+    result_detail = Column(JSON, nullable=True)
+    #: Relative paths of the best plate crops saved for a reviewer (B and C).
+    review_crop_paths = Column(JSON, nullable=True)
 
     track_id = Column(Integer, nullable=True)
     finalize_reason = Column(String(32), default="")

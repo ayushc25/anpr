@@ -28,6 +28,8 @@ def safe_component(value: str, fallback: str = "unknown") -> str:
 class StoredMedia:
     vehicle_path: Optional[str]
     plate_path: Optional[str]
+    #: Extra plate crops kept for a reviewer, in the order given.
+    review_paths: tuple = ()
 
     def as_dict(self) -> dict:
         return {"vehicle_image_path": self.vehicle_path, "plate_image_path": self.plate_path}
@@ -54,13 +56,21 @@ class MediaStore:
         when: datetime,
         vehicle_jpeg: Optional[bytes],
         plate_jpeg: Optional[bytes],
+        review_jpegs: Optional[list] = None,
     ) -> StoredMedia:
         directory = self._day_dir(when)
         stem = f"{safe_component(camera_code, 'cam')}_{safe_component(plate, 'unknown')}_{event_uid[:8]}"
 
         vehicle_path = self._write(directory / f"{stem}.jpg", vehicle_jpeg)
         plate_path = self._write(directory / f"{stem}_plate.jpg", plate_jpeg)
-        return StoredMedia(vehicle_path=vehicle_path, plate_path=plate_path)
+        review_paths = []
+        for index, payload in enumerate(review_jpegs or []):
+            path = self._write(directory / f"{stem}_review{index + 1}.jpg", payload)
+            if path:
+                review_paths.append(path)
+        return StoredMedia(
+            vehicle_path=vehicle_path, plate_path=plate_path, review_paths=tuple(review_paths)
+        )
 
     def _write(self, path: Path, payload: Optional[bytes]) -> Optional[str]:
         if not payload:

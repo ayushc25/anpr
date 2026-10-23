@@ -66,13 +66,20 @@ class EventProcessor:
         stored = self.media.save(
             event_uid=draft.event_uid,
             camera_code=camera_code,
-            plate=draft.plate_number,
+            plate=draft.plate_number or "",
             when=detected_at,
             vehicle_jpeg=decode_image(draft.vehicle_image_b64),
             plate_jpeg=decode_image(draft.plate_image_b64),
+            review_jpegs=[decode_image(b) for b in draft.review_crops_b64],
         )
 
-        vehicle, match_method = self.vehicles.match(draft.plate_number, detected_at)
+        # A vehicle with no plate string cannot be matched to the registry, and
+        # must not be: matching "" or None would at best find nothing and at
+        # worst find the wrong vehicle.
+        if draft.plate_number:
+            vehicle, match_method = self.vehicles.match(draft.plate_number, detected_at)
+        else:
+            vehicle, match_method = None, "none"
         status = self.vehicles.resolve_status(vehicle, detected_at)
 
         corrections = list(draft.corrections)
@@ -84,8 +91,8 @@ class EventProcessor:
             camera_id=draft.camera_id,
             # Store the registry's spelling once matched, so history for a
             # vehicle is not split across two spellings of its plate.
-            plate_number=vehicle.plate_number if vehicle else draft.plate_number,
-            plate_raw=draft.plate_raw or draft.plate_number,
+            plate_number=vehicle.plate_number if vehicle else (draft.plate_number or None),
+            plate_raw=draft.plate_raw or draft.plate_number or "",
             vehicle_id=vehicle.id if vehicle else None,
             resident_id=vehicle.resident_id if vehicle else None,
             direction=_direction(draft.direction),
@@ -105,6 +112,10 @@ class EventProcessor:
             track_id=draft.track_id,
             finalize_reason=draft.finalize_reason,
             is_disputed=draft.disputed,
+            result_class=_result_class(draft),
+            result_reason=(draft.result_reason or None),
+            result_detail=({"verification": draft.verification} if draft.verification else None),
+            review_crop_paths=list(stored.review_paths) or None,
             detected_at=detected_at,
         )
         self.events.add(event)
@@ -126,7 +137,12 @@ class EventProcessor:
                 ],
             )
 
-        self._raise_alerts(event, camera, vehicle is not None and status != VehicleStatus.unknown)
+        # Alert rules are all about a PLATE ("Unregistered vehicle UP14...").
+        # A vehicle with no plate string is not a plate that failed a rule; it
+        # is a review-queue item, and an alert reading "Unregistered vehicle
+        # None" would be noise on top of it.
+        if event.plate_number:
+            self._raise_alerts(event, camera, vehicle is not None and status != VehicleStatus.unknown)
 
         logger.info(
             "event %s: %s %s status=%s conf=%.2f match=%s",
@@ -221,6 +237,15 @@ class EventProcessor:
 
         logger.info("event %s corrected %s -> %s by user %s", event_id, original, corrected, user_id)
         return event
+
+
+def _result_class(draft: EventDraft) -> Optional[str]:
+    """The draft's A/B/C, deriving it for a draft spooled before the field existed."""
+    if draft.result_class in ("A", "B", "C"):
+        return draft.result_class
+    if draft.plate_number is None:
+        return "B"
+    return "A" if draft.recognition_state == "confirmed" else "B"
 
 
 def _parse_ts(value: str | datetime | None) -> datetime:

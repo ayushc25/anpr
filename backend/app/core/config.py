@@ -102,6 +102,7 @@ class Settings:
     validation: dict = field(default_factory=dict)
     dedupe: dict = field(default_factory=dict)
     debug: dict = field(default_factory=dict)
+    vlm: dict = field(default_factory=dict)
     locale: LocaleSettings = field(default_factory=LocaleSettings)
     reader: ReaderSettings = field(default_factory=ReaderSettings)
     runtime: RuntimeSettings = field(default_factory=RuntimeSettings)
@@ -153,6 +154,7 @@ def get_settings() -> Settings:
         validation=defaults.get("validation", {}),
         dedupe=defaults.get("dedupe", {}),
         debug=defaults.get("debug", {}),
+        vlm=defaults.get("vlm", {}),
         locale=LocaleSettings(**_subset(LocaleSettings, defaults.get("locale", {}))),
         reader=ReaderSettings(**_subset(ReaderSettings, defaults.get("reader", {}))),
         runtime=RuntimeSettings(**_subset(RuntimeSettings, defaults.get("runtime", {}))),
@@ -217,6 +219,33 @@ def build_validation_config(overrides: Mapping[str, Any] | None = None):
     merged = dict(get_settings().validation)
     merged.update({k: v for k, v in (overrides or {}).items() if v is not None})
     return ValidationConfig(**_subset(ValidationConfig, merged))
+
+
+def build_vlm_config(overrides: Mapping[str, Any] | None = None):
+    """VlmConfig from YAML. ``verification`` is a nested block, merged key by
+    key like ``pipeline.ocr`` so overriding one knob keeps the rest."""
+    from ..events.verification import VerificationConfig
+    from ..vlm.config import VlmConfig
+
+    merged = dict(get_settings().vlm)
+    verification = dict(merged.get("verification") or {})
+    for key, value in (overrides or {}).items():
+        if value is None:
+            continue
+        if key == "verification":
+            verification.update({k: v for k, v in (value or {}).items() if v is not None})
+        else:
+            merged[key] = value
+    data = _subset(VlmConfig, merged)
+    data["verification"] = VerificationConfig(**_subset(VerificationConfig, verification))
+    return VlmConfig(**data)
+
+
+def vlm_authkey() -> bytes:
+    """Shared secret for the worker <-> VLM service socket. Reuses the worker
+    token so there is one secret to manage; the fallback is for a single-box
+    dev install whose socket is bound to loopback anyway."""
+    return (get_settings().worker_token or "anpr-vlm-dev").encode("utf-8")
 
 
 def build_dedupe_config(overrides: Mapping[str, Any] | None = None):

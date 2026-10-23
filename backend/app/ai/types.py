@@ -105,6 +105,14 @@ class PlateObservation:
     appearance: int = 0
     #: Whether this observation was the one an OCR call was spent on.
     ocr_ran: bool = False
+    #: Where the plate was, in full-frame pixels, and which CHAIN of
+    #: observations it belongs to. A chain is a run of looks at what is
+    #: physically the same plate: each is near where the previous one was. A
+    #: track in dense traffic can span several vehicles, and without the chain
+    #: its observations are a mixture of different cars' plates. 0 means
+    #: unknown (an observation made before chains existed, or in a test).
+    bbox: Optional[BBox] = None
+    group: int = 0
 
     @property
     def aspect(self) -> float:

@@ -34,7 +34,23 @@ tracker:
 
 plate_detector:
   impl: yolo_plate_onnx
-  artifact: models/plate/license-plate-finetune-v1l_320.onnx
+  # Single-class nano plate detector (license-plate-nano.pt, from the
+  # vision_sense_edge project). Export with:
+  #   python scripts/export_onnx.py --plate license-plate-nano.pt --plate-imgsz 320
+  #
+  # Chosen over the large v1l model because plate detection runs ~3x/s per
+  # track at the defaults and v1l made it the dominant CPU cost. Measured on a
+  # Ryzen 5 5500U, 1 thread, 201 hand-labelled site vehicle crops
+  # (detect -> ppocr read -> per-read grammar cleanup, exact match):
+  #   nano_320   ~24-44 ms/call   65.7% exact   plate found 201/201
+  #   v1l_320   ~250-490 ms/call  68.2% exact   plate found 201/201
+  # The gap is 5 crops, on a set biased toward v1l (its crops were chosen by
+  # v1l), before multi-frame fusion. Revert by pointing artifact back at
+  # models/plate/license-plate-finetune-v1l_320.onnx.
+  #
+  # The int8 v1l export was SLOWER (~310 ms) and less accurate on this AMD
+  # CPU; do not use it without re-measuring on the target box.
+  artifact: models/plate/license-plate-nano_320.onnx
   backend: auto
   input_size: [320, 320]
   conf_threshold: 0.30
@@ -44,26 +60,58 @@ plate_detector:
   filter_aspect: true
 
 plate_recognizer:
-  # Runnable default: EasyOCR is already installed, so the pipeline works out
-  # of the box. It is NOT the Phase 1 target — it loads a torch runtime and
-  # costs 60-200 ms per crop against 1-3 ms for the ONNX heads below.
-  #
-  # To upgrade (one command, then swap the impl):
+  # PP-OCRv4 English head on ONNX. Fetch once per install:
   #   python scripts/fetch_recognizer.py --ppocr
-  impl: easyocr_legacy
-  min_char_confidence: 0.30
+  #
+  # Measured on 201 hand-labelled plate crops from this site's own events
+  # (single read, after the per-read grammar cleanup the validator applies):
+  #   easyocr_legacy + enhance   18.4% exact   ~120 ms/crop
+  #   ppocr_onnx, raw crop       68.2% exact    ~30 ms/crop (1 thread)
+  # EasyOCR's dominant failure here is 4 -> L in "UP14..." plates; it also
+  # reports one score per text box, so char fusion and grammar_decode had no
+  # per-character evidence to work with.
+  impl: ppocr_onnx
+  artifact: models/recognizer/ppocr_rec_en.onnx
+  # The MODEL's dictionary (95 chars), not the plate alphabet. A 36-char file
+  # here decodes every letter as the wrong one; the recognizer now refuses to
+  # start on a mismatch.
+  charset: models/recognizer/ppocr_en_dict.txt
+  backend: auto
+  height: 48
+  # Keep 320: padding to a fixed width measured ~6 points more accurate than
+  # feeding the plate at its natural width, for about 2x the latency.
+  max_width: 320
+  min_char_confidence: 0.40
 
-  # --- Phase 1 target: uncomment after fetch_recognizer.py ---------------
-  # impl: ppocr_onnx
-  # artifact: models/recognizer/ppocr_rec_en.onnx
-  # charset: models/recognizer/charset.txt
-  # backend: auto
-  # height: 48
-  # max_width: 320
-  # min_char_confidence: 0.40
+  # --- fallback: the prototype recognizer (needs `pip install easyocr`) ---
+  # impl: easyocr_legacy
+  # min_char_confidence: 0.30
 
   # --- Phase 2 target: fine-tuned on harvested Indian plates -------------
   # impl: lprnet_onnx
   # artifact: models/recognizer/lprnet_in_v1.onnx
   # charset: models/recognizer/charset.txt
   # input_size: [96, 48]
+
+# --- the shared VLM (deferred_vlm mode) ---------------------------------------
+# Loaded ONLY by `anpr vlm-service`, never by a camera worker. The artifact is
+# an ONNX Runtime GenAI model DIRECTORY (decoder + vision + embedding), not a
+# single file. Fetch it once:
+#   python scripts/fetch_vlm.py
+#
+# Qwen3-VL-2B-Instruct, INT4 (RTN, block 32), CPU build, ~1.4 GB on disk,
+# ~2.1 GB resident. Feasibility measured on a Ryzen 5 5500U (6C/12T, 7.3 GB RAM)
+# over 40 stored plate crops, default threading:
+#   avg 1.81 s/crop   p50 1.78 s   p95 2.27 s   peak RSS 2.83 GB
+# Accuracy has NOT been measured: there is no ground-truth set yet. Do not
+# quote a VLM accuracy figure until scripts/bench_vlm.py has been run on one.
+#
+# Why Qwen3-VL and not Qwen2-VL: onnxruntime-genai 0.17 has no Qwen2-VL
+# builder or pipeline; it ships qwen2_5_vl and qwen3_vl. Qwen3-VL-2B is the
+# supported 2B.
+vlm_recognizer:
+  impl: qwen_vl_onnx
+  artifact: models/vlm/qwen3-vl-2b-int4-cpu
+  backend: cpu
+  max_new_tokens: 24
+  alternatives_top_k: 6

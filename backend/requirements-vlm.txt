@@ -1,0 +1,22 @@
+# Environment for the shared VLM service (`anpr vlm-service`) ONLY.
+#
+# Separate from requirements.txt on purpose. onnxruntime-genai 0.17 needs a far
+# newer onnxruntime (>=1.30) than the 1.20.1 the detectors and PP-OCR are pinned
+# to and were validated on, and the two cannot be loaded into one interpreter.
+# Keeping them apart means the validated detector stack is untouched; the cost is
+# a second venv:
+#
+#   python -m venv backend/venv-vlm
+#   backend\venv-vlm\Scripts\pip install -r backend/requirements-vlm.txt
+#
+# then point the supervisor at it in configs/default.yaml:
+#   vlm:
+#     python: backend/venv-vlm/Scripts/python.exe
+#
+# The service imports no database or web code; this is everything it needs.
+onnxruntime-genai==0.17.1      # pulls the matching onnxruntime
+opencv-python-headless==4.10.0.84
+numpy
+psutil==6.1.0                  # physical core count for the default thread budget
+pyyaml==6.0.2
+python-dotenv==1.0.1

@@ -112,8 +112,10 @@ events, registry matching, alerts, dashboard, Excel reports** — all CPU-only, 
 - **Harvest and fine-tune.** `scripts/harvest_dataset.py` mines `event_reads` crops, prioritizing
   disputed and operator-corrected events. Fine-tune a nano plate detector and an LPRNet/CRNN
   recognizer on site data. This is where 93% becomes 97%.
-- **Distil the plate detector.** Replace `license-plate-finetune-v1l.pt` (~50 MB `-l` model) with a
-  nano trained on the same data — the single biggest remaining CPU win.
+- **Distil the plate detector.** *Interim done:* the serving config now uses `license-plate-nano.pt`
+  (a nano plate detector from the vision_sense_edge project) — ~10x faster than the `-l` model on
+  CPU for 2.5 points of single-read accuracy on site crops (see `configs/models.yaml`). Still to do:
+  fine-tune a nano on harvested site crops to recover that gap.
 - **INT8 where it actually helps.** Dynamic quantization measured *slower* on the dev box (0.6-0.7x); try static PTQ with site calibration frames and keep the accuracy gate in CI.
 - **OpenVINO EP** enabled and benchmarked on the customer box; auto-select at startup.
 - **Two-line plate handling** for two-wheelers and commercial vehicles.

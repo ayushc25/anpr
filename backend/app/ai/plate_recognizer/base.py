@@ -35,6 +35,20 @@ class PlateRecognizer(ABC):
     def expects_grayscale(self) -> bool:
         return True
 
+    @property
+    def supports_verification(self) -> bool:
+        """Whether ``verify`` is implemented. CTC heads cannot answer "does
+        this crop read X?" — only a model that can be asked can."""
+        return False
+
+    def verify(self, plate_image: np.ndarray, candidate: str) -> Optional[float]:
+        """Probability that ``plate_image`` reads exactly ``candidate``.
+
+        None means "no answer", which is not the same as 0.5: callers treat a
+        missing answer as missing evidence, never as a coin flip.
+        """
+        return None
+
     def warmup(self, n: int = 2) -> float:
         return 0.0
 

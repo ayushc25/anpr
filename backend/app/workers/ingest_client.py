@@ -143,9 +143,10 @@ class NullIngestClient(IngestClient):
     def _send(self, payload: dict) -> bool:
         self.events.append(payload)
         logger.info(
-            "[dry-run] %s %s conf=%.2f reads=%d",
-            payload["plate_number"], payload["direction"],
-            payload["plate_confidence"], payload["read_count"],
+            "[dry-run] class=%s %s %s conf=%.2f reads=%d reason=%s",
+            payload.get("result_class") or "?", payload["plate_number"] or "(no plate)",
+            payload["direction"], payload["plate_confidence"], payload["read_count"],
+            payload.get("result_reason") or "-",
         )
         return True
 

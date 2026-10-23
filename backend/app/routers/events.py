@@ -30,6 +30,7 @@ def _serialize(e: models.Event) -> schemas.EventOut:
         # vehicle registered to one, so reading it directly showed a blank
         # owner for every properly-registered vehicle.
         owner_name=e.vehicle.display_owner if e.vehicle else None,
+        result_class=e.result_class, result_reason=e.result_reason,
     )
 
 

@@ -75,7 +75,11 @@ export default function Dashboard() {
               <tbody>
                 {latest.map((e) => (
                   <tr key={e.id}>
-                    <td className="font-mono">{e.plate_number}</td>
+                    <td className="font-mono">{e.plate_number || (
+                      <span className="text-app-muted">
+                        {e.result_class === 'C' ? 'no plate visible' : 'not read'}
+                      </span>
+                    )}</td>
                     <td className="capitalize">{e.vehicle_type}</td>
                     <td>{new Date(e.detected_at).toLocaleTimeString()}</td>
                     <td>{e.camera_name || '—'}</td>

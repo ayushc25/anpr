@@ -51,6 +51,7 @@ def _load_recognizers() -> dict[str, Callable[..., PlateRecognizer]]:
     from .plate_recognizer.lprnet_onnx import LprnetOnnxRecognizer
     from .plate_recognizer.ppocr_onnx import PpOcrOnnxRecognizer
 
+
     registry["lprnet_onnx"] = LprnetOnnxRecognizer
     registry["ppocr_onnx"] = PpOcrOnnxRecognizer
     try:
@@ -62,11 +63,30 @@ def _load_recognizers() -> dict[str, Callable[..., PlateRecognizer]]:
     return registry
 
 
+def _load_vlm_recognizers() -> dict[str, Callable[..., PlateRecognizer]]:
+    """The VLM stage's own loader, and deliberately NOT ``_load_recognizers``.
+
+    The CTC recognizers import the ``onnxruntime`` package. ``onnxruntime_genai``
+    brings its own, newer, onnxruntime build, and the two cannot share a
+    process on Windows: whichever loads second dies with "DLL initialization
+    routine failed" or an ORT API-version error. The VLM service therefore must
+    never import the CTC heads, and this loader is how the registry keeps its
+    promise of importing only what the configured stage names.
+    """
+    from .plate_recognizer.qwen_vl_onnx import QwenVlOnnxRecognizer
+
+    return {"qwen_vl_onnx": QwenVlOnnxRecognizer}
+
+
 _LOADERS = {
     "vehicle_detector": _load_vehicle_detectors,
     "tracker": _load_trackers,
     "plate_detector": _load_plate_detectors,
     "plate_recognizer": _load_recognizers,
+    # The VLM service's recognizer. A separate STAGE from plate_recognizer so
+    # the camera workers (which must never load a 2 GB model each) and the one
+    # shared service read different config blocks from the same registry.
+    "vlm_recognizer": _load_vlm_recognizers,
 }
 
 
@@ -116,3 +136,9 @@ def build_plate_recognizer(
     cfg: dict, threads: ThreadBudget | None = None, cache_dir: str | Path | None = None
 ) -> PlateRecognizer:
     return _build("plate_recognizer", cfg, {"threads": threads, "cache_dir": cache_dir})
+
+
+def build_vlm_recognizer(
+    cfg: dict, threads: ThreadBudget | None = None, cache_dir: str | Path | None = None
+) -> PlateRecognizer:
+    return _build("vlm_recognizer", cfg, {"threads": threads, "cache_dir": cache_dir})

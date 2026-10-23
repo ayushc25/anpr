@@ -107,7 +107,23 @@ export default function Events() {
                       <div className="w-14 h-10 surface-1 rounded" />
                     )}
                   </td>
-                  <td className="font-mono">{e.plate_number}</td>
+                  <td className="font-mono">
+                    {e.plate_number || (
+                      <span className="text-app-muted">
+                        {e.result_class === 'C' ? 'no plate visible' : 'not read'}
+                      </span>
+                    )}
+                    {e.result_class && e.result_class !== 'A' && (
+                      <span
+                        className="ml-2 text-xs text-app-muted"
+                        title={e.result_reason ? e.result_reason.replace(/_/g, ' ') : ''}
+                      >
+                        {e.result_class === 'C'
+                          ? 'C'
+                          : `B · ${(e.result_reason || 'review').replace(/_/g, ' ')}`}
+                      </span>
+                    )}
+                  </td>
                   <td className="capitalize">{e.vehicle_type}</td>
                   <td><ColorTag color={e.vehicle_color} /></td>
                   <td><ColorTag color={e.plate_color} /></td>
@@ -148,8 +164,8 @@ export default function Events() {
       {preview && (
         <ImageLightbox
           src={`/api/media/${preview.image_path}`}
-          alt={preview.plate_number}
-          filename={`${preview.plate_number}_${preview.id}.jpg`}
+          alt={preview.plate_number || 'no plate'}
+          filename={`${preview.plate_number || 'noplate'}_${preview.id}.jpg`}
           onClose={() => setPreview(null)}
         />
       )}

@@ -21,14 +21,14 @@ models:
         - 84
         - 8400
   plate:
-    artifact: models/plate/license-plate-finetune-v1l_320.onnx
-    source_weights: license-plate-finetune-v1l.pt
+    artifact: models/plate/license-plate-nano_320.onnx
+    source_weights: license-plate-nano.pt
     input_size:
     - 320
     - 320
-    sha256: a2d11abbfe8c0a1c52aaefb0d5a236625f19c50cb36c4f5538204a88ab207d31
-    size_bytes: 101269185
-    exported_at: '2026-08-30T08:38:21+00:00'
+    sha256: 9e4eb858aaec1ee7f47884fb7723535ae3fe13983773726b330e75b540fc47ab
+    size_bytes: 9599364
+    exported_at: '2026-09-25T07:38:42+00:00'
     io:
       inputs:
         images:

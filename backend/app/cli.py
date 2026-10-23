@@ -2,6 +2,7 @@
 
     python -m backend.app.cli worker --camera-id 3
     python -m backend.app.cli supervisor
+    python -m backend.app.cli vlm-service
     python -m backend.app.cli bench --clip tests/fixtures/clips/day.mp4
     python -m backend.app.cli models check
 
@@ -46,8 +47,10 @@ def cmd_worker(args) -> int:
         build_dedupe_config,
         build_pipeline_config,
         build_validation_config,
+        build_vlm_config,
         get_settings,
         model_config,
+        vlm_authkey,
     )
     from .events.multi_frame_validator import SnapshotRegistry
     from .workers.camera_worker import CameraConfig, CameraWorker
@@ -61,9 +64,17 @@ def cmd_worker(args) -> int:
 
     registry = SnapshotRegistry(_load_registry_snapshot())
 
+    pipeline_cfg = build_pipeline_config(camera.pipeline_overrides)
+    vlm_cfg = build_vlm_config()
+    vlm_client = None
+    if pipeline_cfg.recognition_mode == "deferred_vlm":
+        vlm_client = _build_vlm_client(vlm_cfg, budget, settings, vlm_authkey())
+
     worker = CameraWorker(
         camera=camera,
-        pipeline_cfg=build_pipeline_config(camera.pipeline_overrides),
+        pipeline_cfg=pipeline_cfg,
+        vlm_cfg=vlm_cfg,
+        vlm_client=vlm_client,
         validation_cfg=build_validation_config(),
         dedupe_cfg=build_dedupe_config(),
         model_cfgs={
@@ -97,6 +108,25 @@ def cmd_worker(args) -> int:
     )
     worker.run()
     return 0
+
+
+def _build_vlm_client(vlm_cfg, budget, settings, authkey: bytes):
+    """The camera worker's handle on the VLM.
+
+    "socket" (production) connects to the one shared service and loads no
+    model. "local" loads the model in THIS process, which is only sensible for
+    a single camera on a dev box.
+    """
+    from .ai.registry import build_vlm_recognizer
+    from .core.config import model_config
+    from .vlm.client import build_client
+
+    recognizer = None
+    if vlm_cfg.mode == "local":
+        recognizer = build_vlm_recognizer(model_config("vlm_recognizer"), budget, settings.model_cache_dir)
+    return build_client(
+        vlm_cfg.mode, vlm_cfg.host, vlm_cfg.port, authkey, vlm_cfg.client_pending, recognizer=recognizer
+    )
 
 
 def _load_camera_config(camera_id: int):
@@ -161,16 +191,73 @@ def _load_registry_snapshot() -> dict[str, str]:
         session.close()
 
 
+# ------------------------------------------------------------ vlm service ---
+def vlm_thread_count(settings=None) -> int:
+    """Threads for the VLM service: ``vlm.threads``, or half the physical
+    cores (at least 1). Half, because the same box runs the camera workers'
+    detectors; the supervisor subtracts this from what they are given."""
+    from .ai.inference.threading import physical_cores
+    from .core.config import get_settings
+
+    settings = settings or get_settings()
+    configured = int((settings.vlm or {}).get("threads", 0) or 0)
+    return configured if configured > 0 else max(1, physical_cores() // 2)
+
+
+def cmd_vlm_service(args) -> int:
+    """The one shared Qwen-VL process. See docs/ARCHITECTURE.md."""
+    from .core.config import get_settings
+
+    settings = get_settings()
+    # Before numpy / onnxruntime are imported, like every other entrypoint.
+    threads = int(os.environ.get("ANPR_INTRA_OP") or vlm_thread_count(settings))
+    from .ai.inference.threading import ThreadBudget, apply_process_thread_budget
+
+    budget = ThreadBudget(intra_op=threads)
+    apply_process_thread_budget(budget)
+
+    from .ai.registry import build_vlm_recognizer
+    from .core.config import build_vlm_config, model_config, vlm_authkey
+    from .vlm.server import run_service
+
+    vlm_cfg = build_vlm_config()
+    log = logging.getLogger("anpr.vlm")
+    log.info("loading the VLM (%d threads)...", threads)
+    recognizer = build_vlm_recognizer(model_config("vlm_recognizer"), budget, settings.model_cache_dir)
+    log.info("VLM loaded; warm-up %.0f ms", recognizer.warmup(1))
+    run_service(
+        recognizer,
+        host=args.host or vlm_cfg.host,
+        port=args.port or vlm_cfg.port,
+        authkey=vlm_authkey(),
+        queue_size=vlm_cfg.queue_size,
+        max_job_age_s=vlm_cfg.max_job_age_s,
+    )
+    return 0
+
+
 # ------------------------------------------------------------ supervisor ----
 def cmd_supervisor(args) -> int:
     from .core.config import get_settings
     from .workers.supervisor import Supervisor
 
     settings = get_settings()
+    pipeline = settings.pipeline or {}
+    vlm = settings.vlm or {}
+    # The service is the supervisor's to run only when the cameras are in
+    # deferred mode AND reach it over the socket. mode "local" has no service,
+    # and --no-vlm-service is for a service started separately (or elsewhere).
+    manage_vlm = (
+        pipeline.get("recognition_mode") == "deferred_vlm"
+        and vlm.get("mode", "socket") == "socket"
+        and not args.no_vlm_service
+    )
     Supervisor(
         reconcile_interval=args.interval,
         reserve_cores=settings.runtime.reserve_cores,
         dry_run=args.dry_run,
+        vlm_threads=vlm_thread_count(settings) if manage_vlm else 0,
+        vlm_python=str(settings.resolve(vlm["python"])) if vlm.get("python") else "",
     ).run()
     return 0
 
@@ -182,7 +269,7 @@ def cmd_models(args) -> int:
     from .core.config import model_config
 
     if args.action == "list":
-        for stage in ("vehicle_detector", "tracker", "plate_detector", "plate_recognizer"):
+        for stage in ("vehicle_detector", "tracker", "plate_detector", "plate_recognizer", "vlm_recognizer"):
             print(f"{stage}:")
             for name in available(stage):
                 marker = " *" if model_config(stage).get("impl") == name else "  "
@@ -193,7 +280,7 @@ def cmd_models(args) -> int:
     from pathlib import Path
 
     ok = True
-    for stage in ("vehicle_detector", "plate_detector", "plate_recognizer"):
+    for stage in ("vehicle_detector", "plate_detector", "plate_recognizer", "vlm_recognizer"):
         cfg = model_config(stage)
         artifact = cfg.get("artifact")
         if not artifact:
@@ -228,7 +315,16 @@ def build_parser() -> argparse.ArgumentParser:
     supervisor = sub.add_parser("supervisor", help="spawn and supervise all camera workers")
     supervisor.add_argument("--interval", type=float, default=5.0)
     supervisor.add_argument("--dry-run", action="store_true")
+    supervisor.add_argument(
+        "--no-vlm-service", action="store_true",
+        help="do not start the shared VLM service (it runs elsewhere, or separately)",
+    )
     supervisor.set_defaults(func=cmd_supervisor)
+
+    vlm = sub.add_parser("vlm-service", help="run the shared Qwen-VL service the camera workers talk to")
+    vlm.add_argument("--host", default="")
+    vlm.add_argument("--port", type=int, default=0)
+    vlm.set_defaults(func=cmd_vlm_service)
 
     models = sub.add_parser("models", help="inspect configured models")
     models.add_argument("action", choices=("list", "check"), default="check", nargs="?")

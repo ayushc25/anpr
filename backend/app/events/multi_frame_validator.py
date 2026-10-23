@@ -204,6 +204,10 @@ class FinalPlate:
     unstable_positions: list[str] = field(default_factory=list)
     #: Why the ANPR confidence was capped, if it was.
     cap_reason: str = ""
+    #: What the conditional VLM verification pass concluded, if one ran. Empty
+    #: otherwise. Written by ``events.verification``; the validator itself
+    #: never sets it. See that module for why verification can only downgrade.
+    verification: dict = field(default_factory=dict)
 
     @property
     def is_confirmed(self) -> bool:

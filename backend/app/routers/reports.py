@@ -98,7 +98,7 @@ def _write_detailed_sheet(ws, events):
     for e in events:
         ws.append([
             e.detected_at.strftime("%Y-%m-%d %H:%M:%S"),
-            e.plate_number,
+            e.plate_number or "",
             e.vehicle_type,
             (e.vehicle_color or "").title(),
             (e.plate_color or "").title(),

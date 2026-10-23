@@ -18,6 +18,7 @@ constraint: **x86 CPU only, no CUDA, no TensorRT.**
 - [I. OpenVINO vs ONNX Runtime](#i-openvino-vs-onnx-runtime)
 - [J. Multi-frame validation algorithm](#j-multi-frame-validation-algorithm)
 - [K. API surface](#k-api-surface)
+- [L. Deferred CPU-VLM recognition](#l-deferred-cpu-vlm-recognition-pipelinerecognition_mode-deferred_vlm)
 - Roadmap and phasing: see [ROADMAP.md](ROADMAP.md)
 
 ---
@@ -30,7 +31,7 @@ constraint: **x86 CPU only, no CUDA, no TensorRT.**
 | 2 | **All models are ONNX artifacts behind four interfaces**, loaded through a pluggable `InferenceBackend` (ONNX Runtime *or* OpenVINO). | Swap YOLO to RT-DETR, or LPRNet to PP-OCR, without touching pipeline code — and A/B the backends on the customer's actual hardware. |
 | 3 | **Decode the camera sub-stream (D1/720p) for AI; pull the main stream only for the evidence snapshot.** | Decoding 4x 1080p H.264 costs more CPU than all four inference stages combined. This one decision roughly triples camera density per box. |
 | 4 | **Recognition is never trusted from one frame.** A track accumulates weighted reads; a plate is emitted on line-cross or track exit, after quality-weighted positional voting. | Real gate footage is motion-blurred, angled, backlit. Single-frame OCR at a gate runs 70–85%; multi-frame voting on the same footage reaches 93–97%. |
-| 5 | **The pipeline is cascaded and gated.** Vehicle detector on 1-in-N frames → tracker on every processed frame → plate detector only on in-ROI vehicle crops → recognizer only on plate crops that pass a quality gate. | The recognizer touches ~2% of frames. This is where the CPU budget is won. |
+| 5 | **The pipeline is cascaded and gated.** *(Sections C-J describe `recognition_mode: inline`. The shipped default, `deferred_vlm`, moves recognition after track finalization and into one shared service: see [section L](#l-deferred-cpu-vlm-recognition-pipelinerecognition_mode-deferred_vlm).)* Vehicle detector on 1-in-N frames → tracker on every processed frame → plate detector only on in-ROI vehicle crops → recognizer only on plate crops that pass a quality gate. | The recognizer touches ~2% of frames. This is where the CPU budget is won. |
 
 ---
 
@@ -1158,3 +1159,200 @@ The **ROI / virtual-line editor** deserves calling out as the highest-value fron
 canvas over `/cameras/{id}/snapshot` where the operator draws a polygon and a directed line, saved
 as normalized coordinates. Site accuracy depends more on this being drawn well than on any model
 choice, so make it a first-class screen, not a JSON textarea.
+
+
+---
+
+## L. Deferred CPU-VLM recognition (`pipeline.recognition_mode: deferred_vlm`)
+
+A second recognition architecture, selectable per install. Everything up to and including plate
+*observation* is unchanged (sections C and J still describe it); what changes is **where a plate gets
+read** and **what a finished vehicle looks like**.
+
+| | `inline` (sections C, J) | `deferred_vlm` (this section) |
+|---|---|---|
+| Recognizer | CTC head (PP-OCR / LPRNet), in the camera process | Qwen3-VL-2B INT4, in **one shared service process** |
+| When it runs | On the frame that produced the crop, under the OCR scheduler's budget | After the track is finalized, on the vehicle's best 5-7 crops |
+| Result latency | Milliseconds | Seconds to tens of seconds. **Accepted by design**: nothing here opens a boom |
+| Result | One event per vehicle, a plate and a confidence | One event per vehicle, class **A / B / C** |
+| Selected by | `recognition_mode: inline` | `recognition_mode: deferred_vlm` (the shipped default) |
+
+`inline` remains a one-line fallback for a box that cannot run the service. PP-OCR is *not* the primary
+recognizer in this architecture, and there is **no automatic fallback to it**: when the VLM cannot take a
+vehicle, the vehicle becomes a visible class B, not a quietly different read.
+
+### L.1 Flow
+
+```text
+CAMERA PROCESS (one per camera, no recognizer loaded)           VLM SERVICE (one process, one model)
+------------------------------------------------------           --------------------------------
+RtspReader -> ROI -> vehicle detector (1-in-N) -> ByteTrack
+   -> per-track gating -> plate detector -> deskew -> quality score
+   -> TrackState.note_observation()      keeps the top-8 distinct crops per track
+        |                                (NO recognition here, ever)
+        v
+ track finalized (line crossed / retired / max_duration)
+        |
+   DeferredFinalizer.begin()
+        |-- never reached the read zone ........................ no event
+        |-- reached it, zero USABLE observations ............... class C   (stored, no VLM call)
+        |-- select_best(): <=6 usable, mutually distinct crops
+        |-- client.submit() refused (bounded) .................. class B   reason=vlm_queue_overflow
+        v                                                           |
+   job {track, PNG crops} ---- socket, bounded ---------------->  queue (bounded, refuses at once)
+   (pipeline keeps running; pending vehicle held in memory)        |  one inference thread
+        ^                                                          v
+   DeferredFinalizer.poll()  <--- JSON result ------------------  recognize each crop (INT4, CPU)
+        |
+        |-- result.status != ok ....... class B (overflow | unavailable | timeout | error)
+        |-- every crop UNREADABLE ..... class B  reason=vlm_unreadable
+        |-- reads -> TrackState.add_read()      <- existing grammar_decode + postprocess.resolve
+        |-- MultiFrameValidator.validate()      <- existing char_fusion, vote, caps, states
+        |-- ambiguous? -> verify job ("does this read exactly X?")   <- downgrade only
+        v
+   classify():  CONFIRMED -> A     PROBABLE / UNRESOLVED -> B
+        |
+   EventBuilder -> IngestClient -> /internal/events -> EventProcessor.ingest()
+```
+
+`DeferredFinalizer` (`workers/deferred.py`) owns this orchestration and nothing else: recognition is the
+client's, scoring is the validator's, emission is the worker's. That separation is what lets the whole
+flow be tested with a fake client and no model.
+
+### L.2 Guarantees
+
+1. **Exactly one event per vehicle that reached the read zone.** A, B or C. Overflow, a dead service, a
+   timeout, an unreadable plate, an inconclusive vote and a bug while finalizing each end as a class B
+   that says which (`result_reason`). Nothing is silently dropped.
+2. **The frame loop never waits on the model.** `submit` and `poll` are bounded in-memory operations;
+   connecting, sending and receiving happen on the client's own I/O thread. Results are polled every loop
+   iteration, whether or not a frame arrived.
+3. **Memory and CPU are bounded.** A pending vehicle holds at most `best_k` crops. The client refuses past
+   `vlm.client_pending`; the service refuses past `vlm.queue_size` and **discards unrun** any job older than
+   `vlm.max_job_age_s`, whose camera has long since given up on it. A slow model produces class B results,
+   never an ever-growing backlog of crops or of dead work.
+4. **One late answer cannot produce a second event.** A camera that timed a job out has already emitted its
+   class B; the straggler is discarded.
+
+This replaces, for this mode only, the inline pipeline's "no backlog, no deferred work" rule. That rule
+existed so recognition could never run on frames that no longer describe the vehicle. Deferred recognition
+runs on *banked crops of one finalized vehicle*, not on live frames, so the failure it guarded against does
+not exist here; the bounded queues are its replacement.
+
+### L.3 Components
+
+| Piece | Where | Notes |
+|---|---|---|
+| Recognizer | `ai/plate_recognizer/qwen_vl_onnx.py` (`qwen_vl_onnx`, stage `vlm_recognizer`) | `recognize(crop)` -> `PlateRead \| None`; `verify(crop, candidate)` -> P(yes) `\| None` |
+| Best-frame selection | `video/best_frames.py` | Pure. Quality-ranked, **distinct** (appearance hash + frame gap), never padded with near-duplicates |
+| Job protocol | `vlm/protocol.py` | JSON header + **PNG** crops (lossless); no pickle on the wire |
+| Client | `vlm/client.py` | `SocketVlmClient` (production), `LocalVlmClient` (tests / one-camera dev) |
+| Service | `vlm/server.py`, `anpr vlm-service` | accept thread, one handler per connection, **one** inference thread |
+| Orchestration | `workers/deferred.py` | `DeferredFinalizer` |
+| Verification policy | `events/verification.py` | Triggers + downgrade-only `apply()` |
+| A/B/C | `events/result_class.py` | The single place a state becomes a class |
+
+**What the recognizer reports, and what it refuses to invent.** Every number is a probability the model
+produced: `confidence` is the geometric mean of the plate tokens' probabilities, `per_char_confidence` is the
+probability of the token each character came from. Qwen's tokenizer emits digits singly but merges some
+letters (`HR`, `BG`), so two characters can share a value, and **runner-up alternatives are offered only at
+positions whose token was a single character**: the model never scored `H` against `N` inside `HR`, and
+fabricating that split would hand `grammar_decode` evidence that does not exist. Output is folded to ASCII
+(the model sometimes emits fullwidth letters). `UNREADABLE` becomes `None`, never a guess.
+
+### L.4 Results: A / B / C
+
+| Class | Meaning | Derived from |
+|---|---|---|
+| **A** auto-accepted | Plate settled; safe to act on unattended | `CONFIRMED`, and not downgraded by verification |
+| **B** human review | A vehicle was there and the system will not claim the plate | `PROBABLE`, `UNRESOLVED`, a downgrade, **or any failure to read at all** |
+| **C** no plate visible | The vehicle crossed the read zone and not one *usable* plate observation came out of it | `plate_attempts > 0` and `select_best() == []` |
+
+C is *not* "nothing detected": a vehicle that never reached the read zone produces no event. C is the
+system looking where a plate should be legible and finding none, which is the difference between an empty
+gate and a covered, missing or out-of-frame plate. "Usable" = crop present, quality >= `vlm.min_quality`,
+width >= `vlm.min_width`.
+
+Reasons (`events.result_reason`): `confirmed`, `ambiguous`, `unresolved`, `verification_rejected`,
+`verification_unavailable`, `vlm_queue_overflow`, `vlm_unavailable`, `vlm_timeout`, `vlm_unreadable`,
+`no_consensus`, `no_usable_plate_observation`.
+
+**Schema** (migration `c41e7a9b2d10`): `events.plate_number` becomes **nullable**; adds `result_class`
+(indexed, `A|B|C`, NULL on pre-existing rows), `result_reason`, `result_detail` (JSON, the verification
+verdict), `review_crop_paths` (JSON, saved crops for B/C). A vehicle with no plate string stores **NULL**,
+never `""` or a placeholder: a fake plate matches the wrong thing in a search, a registry lookup or an alert
+rule. Consequently ingest skips registry matching and **raises no plate-based alert** for such an event; it is
+a review-queue item, not "Unregistered vehicle None".
+
+### L.5 Conditional verification
+
+After validation, ambiguous results get one more question: *"does this crop read exactly X?"*, answered from
+the model's Yes/No probability. Triggers: multiple variants, a grammar correction that changed the string,
+unstable positions, an incomplete plate, best quality below `verification.low_quality_below`, or a PROBABLE
+result. UNRESOLVED is never verified (already B, and not a string anyone stakes anything on).
+
+**It can only downgrade.** `verification.apply` is the sole function that touches a result's state and it
+only moves it down (CONFIRMED -> PROBABLE, with the confidence capped below the confirm threshold). A "Yes"
+is recorded for the reviewer and changes nothing. The asymmetry matches the evidence: the verifier is the
+same model that produced the reads, and agrees with its own candidate far more readily than an independent
+check would, so its yes is weak and its no is strong. A verification that cannot run follows
+`verification.on_unavailable` (default `downgrade`: "could not check" is not "checked and fine").
+
+### L.6 Operations
+
+**Two Python environments.** `onnxruntime-genai` 0.17 needs a far newer `onnxruntime` (>=1.30) than the
+1.20.1 the detectors and PP-OCR were validated on, and the two cannot share an interpreter. The service
+therefore has its own venv (`backend/requirements-vlm.txt` -> `backend/venv-vlm`), and the supervisor starts
+it with `vlm.python`. The detector stack is untouched.
+
+```bash
+# one-time
+python -m venv backend/venv-vlm
+backend\venv-vlm\Scripts\pip install -r backend/requirements-vlm.txt
+backend\venv-vlm\Scripts\python scripts\fetch_vlm.py        # ~1.4 GB -> models/vlm/qwen3-vl-2b-int4-cpu
+backend\venv\Scripts\python -m alembic upgrade head          # result_class + nullable plate_number
+
+# run: the supervisor starts the VLM service AND the camera workers
+backend\venv\Scripts\python -m backend.app.cli supervisor
+# ...or by hand, e.g. service on its own box (--no-vlm-service on the supervisor)
+backend\venv-vlm\Scripts\python -m backend.app.cli vlm-service
+```
+
+The supervisor gives the service `vlm.threads` (default half the physical cores) and **subtracts them from
+the camera workers' budget**, so detectors and the VLM do not oversubscribe the box. It restarts a dead
+service with backoff; meanwhile vehicles go to class B (`vlm_unavailable`). Camera health reports
+`vlm.{pending, queue_depth, submitted, overflowed, timed_out, unavailable, verifications, downgrades,
+class_a, class_b, class_c}`; a growing `pending` with flat `class_*` is a hung or undersized service.
+
+### L.7 What is not known yet
+
+* **VLM accuracy has not been measured.** There is no ground-truth set; only latency and memory were
+  benchmarked (Ryzen 5 5500U, 40 stored crops, default threading: avg 1.81 s, p50 1.78 s, p95 2.27 s per
+  crop; ~2.1 GB resident, 2.83 GB peak). `scripts/bench_vlm.py` takes a labelled CSV and reports raw and
+  grammar-cleaned exact accuracy with Wilson intervals against the same crops for PP-OCR. **Do not quote a
+  VLM accuracy figure until it has been run.**
+* **Token confidences saturate.** On real crops most reads come back at 0.99-1.00 per character, including
+  wrong ones, and the verifier gave 0.77 to a wrong candidate on one hard crop. Per-read confidence carries
+  little information here; cross-frame agreement is the signal that matters, which is why the fusion,
+  grammar validation and downgrade-only verification are kept rather than trusting the model's own number.
+* **The bar for class A counts distinct views.** `validation.min_reads` (3) is measured against distinct
+  usable reads and the selector will not pad with near-duplicates, so a vehicle that produced only one or
+  two different-looking crops ends as B/UNRESOLVED however confident the model was. Whether that is too
+  strict depends on real approach footage; the knob is `validation.min_reads`, and it is pinned by a test
+  so that a change is deliberate.
+* **Throughput is the binding limit, not recognition.** On a 6-core laptop CPU the service completes about
+  5 vehicles a minute (roughly 12 s per vehicle with 3 threads under camera-worker load). A dense traffic
+  clip produces several times that, so most vehicles are refused as class B (`vlm_queue_overflow`) and
+  never read at all. A gate with a few vehicles a minute fits; a jam does not. Levers, in order of effect:
+  fewer cameras on the same clip, a lighter clip, `vlm.threads`, `vlm.best_k` / `vlm.early_stop_agree`.
+* **Plate continuity chains.** In dense traffic one tracked box can cover several cars, and "most
+  confident plate each frame" alternates between them, so a track collects a mixture of vehicles' plates;
+  the diversity rule then picks them on purpose. Each frame now follows the plate nearest the previous one
+  (`pipeline.plate_continuity_*`), observations carry a chain id, and selection commits to the chain with
+  the most evidence. Not perfect: cars crossing the same spot in successive frames can still share a chain.
+* **Crop margin.** The plate detector emits an axis-aligned box only, and it often clips the first or last
+  character. `pipeline.deferred_plate_crop_pad` (0.15) gives the VLM margin; inline mode keeps 0.06.
+* Upscaling small crops before the VLM was measured and rejected: it raised agreement only modestly
+  (20% -> 33% at 128 px) and cost 3x the latency (5.3 s per crop).
+* Qwen3-VL runs on ORT-GenAI 0.17 as `qwen3_vl`, but upstream treats native support as open work (the
+  3-model split drops DeepStack features). Pin versions, and re-benchmark on upgrade.

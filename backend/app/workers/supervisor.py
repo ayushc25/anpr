@@ -48,10 +48,27 @@ class SupervisorStatus:
 
 
 class Supervisor:
-    def __init__(self, reconcile_interval: float = 5.0, reserve_cores: int = 1, dry_run: bool = False):
+    def __init__(
+        self,
+        reconcile_interval: float = 5.0,
+        reserve_cores: int = 1,
+        dry_run: bool = False,
+        vlm_threads: int = 0,
+        vlm_python: str = "",
+    ):
         self.reconcile_interval = reconcile_interval
         self.reserve_cores = reserve_cores
         self.dry_run = dry_run
+        #: Threads handed to the shared VLM service; 0 means the supervisor
+        #: does not run one. They are SUBTRACTED from what the camera workers
+        #: may use, so the detectors and the VLM do not oversubscribe the box.
+        self.vlm_threads = vlm_threads
+        #: Interpreter for the service (its own venv); empty = this one.
+        self.vlm_python = vlm_python or sys.executable
+        self._vlm: Optional[subprocess.Popen] = None
+        self._vlm_started_at = 0.0
+        self._vlm_restart_at = 0.0
+        self._vlm_backoff = MIN_BACKOFF
         self._workers: dict[int, ManagedWorker] = {}
         self._pending: dict[int, float] = {}   # camera_id -> restart_at
         self._backoff: dict[int, float] = {}
@@ -82,7 +99,7 @@ class Supervisor:
     def _worker_env(self, n_workers: int) -> dict:
         """Thread budget goes in the environment because OpenMP reads it at
         import time — setting it inside the worker would be too late."""
-        budget = compute_budget(n_workers, reserve=self.reserve_cores)
+        budget = compute_budget(n_workers, reserve=self.reserve_cores + self.vlm_threads)
         env = dict(os.environ)
         env.update(budget.as_env)
         env["ANPR_INTRA_OP"] = str(budget.intra_op)
@@ -114,8 +131,48 @@ class Supervisor:
         except Exception:
             logger.debug("error stopping worker %s", camera_id, exc_info=True)
 
+    # -- the shared VLM service --------------------------------------------
+    def _ensure_vlm(self) -> None:
+        """Keep exactly one VLM service running, restarting it with backoff.
+
+        A dead service is not an emergency for the pipeline - vehicles go to
+        class B with reason "vlm_unavailable" meanwhile - but it should come
+        back on its own, and a model that crashes on load must not spin.
+        """
+        if not self.vlm_threads:
+            return
+        now = time.monotonic()
+        if self._vlm is not None:
+            if self._vlm.poll() is None:
+                return
+            uptime = now - self._vlm_started_at
+            logger.warning("VLM service exited (code %s) after %.0fs", self._vlm.returncode, uptime)
+            self._vlm = None
+            self._vlm_backoff = MIN_BACKOFF if uptime > 120 else min(self._vlm_backoff * 2, MAX_BACKOFF)
+            self._vlm_restart_at = now + self._vlm_backoff
+        if now < self._vlm_restart_at:
+            return
+        env = dict(os.environ)
+        env["ANPR_INTRA_OP"] = str(self.vlm_threads)
+        logger.info("starting the VLM service (%d threads)", self.vlm_threads)
+        self._vlm = subprocess.Popen([self.vlm_python, "-m", "backend.app.cli", "vlm-service"], env=env)
+        self._vlm_started_at = now
+
+    def _stop_vlm(self, timeout: float = 12.0) -> None:
+        if self._vlm is None:
+            return
+        try:
+            self._vlm.terminate()
+            self._vlm.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self._vlm.kill()
+        except Exception:
+            logger.debug("error stopping the VLM service", exc_info=True)
+        self._vlm = None
+
     # -- reconciliation ----------------------------------------------------
     def reconcile(self) -> None:
+        self._ensure_vlm()
         desired = self.desired_camera_ids()
         running = set(self._workers)
         now = time.monotonic()
@@ -157,7 +214,9 @@ class Supervisor:
 
     def status(self) -> SupervisorStatus:
         cores = physical_cores()
-        budget = compute_budget(max(1, len(self._workers)), reserve=self.reserve_cores, cores=cores)
+        budget = compute_budget(
+            max(1, len(self._workers)), reserve=self.reserve_cores + self.vlm_threads, cores=cores
+        )
         workers = {
             camera_id: {
                 "pid": managed.process.pid,
@@ -191,3 +250,5 @@ class Supervisor:
             logger.info("supervisor stopping %d workers", len(self._workers))
             for camera_id in list(self._workers):
                 self._stop_worker(camera_id)
+            # Last, so the workers' shutdown drain can still reach it.
+            self._stop_vlm()

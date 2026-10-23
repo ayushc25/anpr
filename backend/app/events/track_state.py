@@ -173,6 +173,13 @@ class TrackState:
     frames_since_plate_attempt: int = 999
     plate_attempts: int = 0
 
+    # -- plate continuity ----------------------------------------------------
+    #: The plate this track last observed, and the chain it belongs to. See
+    #: PlateObservation.group and FrameProcessor._pick_candidate.
+    last_plate_bbox: Optional[tuple] = None
+    last_plate_frame: int = -999
+    plate_group: int = 0
+
     # -- OCR budget and scheduling ----------------------------------------
     #
     # Deliberately separate counters from the plate-attempt ones above.
