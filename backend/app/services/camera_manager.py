@@ -247,6 +247,9 @@ class CameraWorker:
         # plate -> (last_seen_ts, event_id, score)
         self._recent_plates: dict[str, tuple] = {}
         self.tracks: dict[int, VehicleTrack] = {}
+        from ..ai.anpr_pipeline import ANPREngine
+        self.engine = ANPREngine.get_shared()
+        self.session = self.engine.new_session(source_name=f"camera-{self.camera_id}")
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
@@ -316,11 +319,16 @@ class CameraWorker:
                 if now - last_detect >= DETECTION_FRAME_INTERVAL:
                     last_detect = now
                     try:
-                        last_boxes = self._process_frame(frame)
+                        annotated, events, boxes = self.session.process(frame, now)
+                        frame = annotated
+                        for ev in events:
+                            self._record_session_event(ev)
+                        last_boxes = boxes
                     except Exception:
                         logger.exception("camera %s: detection pass failed", self.camera_id)
                         last_boxes = []
-                self._draw_overlay(frame, last_boxes)
+                else:
+                    self._draw_overlay(frame, last_boxes)
                 # Encoding 1080p costs ~64 ms per frame. Downscaling the
                 # preview cuts that by an order of magnitude and nobody can
                 # see the difference in a browser panel.
@@ -345,6 +353,47 @@ class CameraWorker:
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             label = b.get("plate") or b.get("vehicle_type", "vehicle")
             cv2.putText(frame, label, (x1, max(y1 - 8, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    def _record_session_event(self, ev):
+        db = SessionLocal()
+        try:
+            cam = db.query(models.Camera).get(self.camera_id)
+            status, vehicle_row = self._classify(db, ev.plate)
+            plate = vehicle_row.plate_number if vehicle_row else ev.plate
+
+            image_rel = None
+            if ev.snapshot is not None:
+                import io
+                buf = io.BytesIO()
+                ev.snapshot.convert("RGB").save(buf, format="JPEG", quality=90)
+                crop_bytes = buf.getvalue()
+                image_rel = self._save_image(crop_bytes, plate, cam.name if cam else None)
+
+            event = models.Event(
+                plate_number=plate,
+                plate_raw=ev.plate,
+                vehicle_id=vehicle_row.id if vehicle_row else None,
+                camera_id=self.camera_id,
+                vehicle_type="vehicle",
+                vehicle_color="unknown",
+                plate_color="white",
+                direction=_event_direction(cam),
+                status=status,
+                detect_confidence=1.0,
+                plate_confidence=float(ev.confidence),
+                read_count=int(ev.agree),
+                vehicle_image_path=image_rel,
+            )
+            db.add(event)
+            db.commit()
+            logger.info(
+                "camera %s: recorded ANPR event %s (reads=%d conf=%.2f valid=%s)",
+                self.camera_id, plate, ev.agree, ev.confidence, ev.valid,
+            )
+        except Exception:
+            logger.exception("camera %s: failed to record session event", self.camera_id)
+        finally:
+            db.close()
 
     def _process_frame(self, frame):
         now = time.time()

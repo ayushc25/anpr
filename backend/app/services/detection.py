@@ -221,44 +221,20 @@ def _preprocess_for_ocr(roi: np.ndarray) -> np.ndarray:
 
 
 def _ocr_roi(roi: np.ndarray):
-    """Runs OCR on a single ROI, returns the best plate-shaped reading (text, conf)."""
+    """Runs OCR on a single ROI using the fine-tuned ANPR PP-OCRv6 engine."""
     if roi is None or roi.size == 0:
         return None, 0.0
     try:
-        processed = _preprocess_for_ocr(roi)
-        reader = get_ocr_reader()
-        # recognize() instead of readtext(): readtext runs EasyOCR's CRAFT
-        # text-DETECTION network first, which is the expensive half (732 ms vs
-        # 214 ms measured). We already localized the plate with the plate
-        # detector, so re-detecting text inside that crop is pure waste.
-        grey = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY) if processed.ndim == 3 else processed
-        height, width = grey.shape[:2]
-        results = reader.recognize(
-            grey, horizontal_list=[[0, width, 0, height]], free_list=[], allowlist=OCR_ALLOWLIST
-        )
+        from PIL import Image
+        from ..ai.anpr_pipeline import ANPREngine
+        engine = ANPREngine.get_shared()
+        crop_pil = Image.fromarray(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
+        text, raw, conf = engine.read_plate(crop_pil)
+        if text and len(text) >= 4:
+            return text, float(conf)
     except Exception:
-        logger.exception("OCR read failed")
-        return None, 0.0
-
-    # Score every reading by confidence AND by how plate-shaped it is, rather
-    # than taking the most confident string outright. EasyOCR is routinely
-    # confident about the wrong thing — it will report the emblem strip or the
-    # dealer sticker at 0.9 — and on a crop that yields two readings, the one
-    # that parses as a real plate is the answer even when it scores lower.
-    best_text, best_conf, best_score = None, 0.0, 0.0
-    for _, text, conf in results:
-        cleaned = postprocess.normalize(text)
-        if len(cleaned) < postprocess.MIN_LEN:
-            continue
-        conf = float(conf)
-        score = conf * postprocess.grammar_factor(postprocess.resolve(cleaned).text)
-        if score > best_score:
-            best_text, best_conf, best_score = cleaned, conf, score
-    # EasyOCR returns numpy scalars. psycopg2 has no adapter for np.float64
-    # and renders it as the literal text "np.float64(0.8)", which Postgres
-    # then rejects with 'schema "np" does not exist' — so an event that got
-    # this far would fail to insert. Coerce at the boundary.
-    return best_text, float(best_conf)
+        logger.exception("ANPR OCR read failed")
+    return None, 0.0
 
 
 def read_plate(frame: np.ndarray, bbox):
