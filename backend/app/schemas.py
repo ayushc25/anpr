@@ -189,6 +189,8 @@ class EventOut(BaseModel):
     confidence: float
     ocr_confidence: float
     image_path: Optional[str] = None
+    vehicle_image_path: Optional[str] = None
+    plate_image_path: Optional[str] = None
     detected_at: UtcDatetime
     camera_name: Optional[str] = None
     owner_name: Optional[str] = None

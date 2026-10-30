@@ -13,24 +13,38 @@ router = APIRouter(prefix="/events", tags=["events"])
 
 
 def _serialize(e: models.Event) -> schemas.EventOut:
+    plate_path = e.plate_image_path
+    vehicle_path = e.vehicle_image_path
+
+    # If plate_path is missing but vehicle_path points to plate or has a matching _plate.jpg
+    if not plate_path and vehicle_path:
+        if "_plate.jpg" in vehicle_path:
+            plate_path = vehicle_path
+        elif vehicle_path.endswith(".jpg"):
+            candidate = vehicle_path[:-4] + "_plate.jpg"
+            if (STORAGE_DIR / candidate).exists():
+                plate_path = candidate
+
     return schemas.EventOut(
-        id=e.id, plate_number=e.plate_number, vehicle_id=e.vehicle_id, camera_id=e.camera_id,
-        vehicle_type=e.vehicle_type, vehicle_color=e.vehicle_color, plate_color=e.plate_color,
-        direction=e.direction, status=e.status,
-        # The columns were renamed in the Phase 1 schema (confidence ->
-        # detect_confidence, ocr_confidence -> plate_confidence, image_path ->
-        # vehicle_image_path). The RESPONSE field names are kept as-is so the
-        # existing frontend is unaffected; only the mapping moved.
+        id=e.id,
+        plate_number=e.plate_number,
+        vehicle_id=e.vehicle_id,
+        camera_id=e.camera_id,
+        vehicle_type=e.vehicle_type,
+        vehicle_color=e.vehicle_color,
+        plate_color=e.plate_color,
+        direction=e.direction,
+        status=e.status,
         confidence=e.detect_confidence or 0.0,
         ocr_confidence=e.plate_confidence or 0.0,
-        image_path=e.vehicle_image_path, detected_at=e.detected_at,
+        image_path=vehicle_path or plate_path,
+        vehicle_image_path=vehicle_path,
+        plate_image_path=plate_path,
+        detected_at=e.detected_at,
         camera_name=e.camera.name if e.camera else None,
-        # display_owner falls back to the linked resident: once residents
-        # were split out of the vehicles table, owner_name is empty on any
-        # vehicle registered to one, so reading it directly showed a blank
-        # owner for every properly-registered vehicle.
         owner_name=e.vehicle.display_owner if e.vehicle else None,
-        result_class=e.result_class, result_reason=e.result_reason,
+        result_class=e.result_class,
+        result_reason=e.result_reason,
     )
 
 
@@ -69,4 +83,23 @@ def get_event_image(event_id: int, db: Session = Depends(get_db), _: models.User
     path = STORAGE_DIR / e.vehicle_image_path
     if not path.exists():
         raise HTTPException(status_code=404, detail="Image file missing")
+    return FileResponse(path)
+
+
+@router.get("/{event_id}/plate-image")
+def get_event_plate_image(event_id: int, db: Session = Depends(get_db), _: models.User = Depends(get_current_user)):
+    e = db.query(models.Event).get(event_id)
+    plate_path = e.plate_image_path if e else None
+    if not plate_path and e and e.vehicle_image_path:
+        if "_plate.jpg" in e.vehicle_image_path:
+            plate_path = e.vehicle_image_path
+        elif e.vehicle_image_path.endswith(".jpg"):
+            candidate = e.vehicle_image_path[:-4] + "_plate.jpg"
+            if (STORAGE_DIR / candidate).exists():
+                plate_path = candidate
+    if not plate_path:
+        raise HTTPException(status_code=404, detail="Plate image not found")
+    path = STORAGE_DIR / plate_path
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Plate image file missing")
     return FileResponse(path)

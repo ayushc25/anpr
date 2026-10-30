@@ -136,12 +136,7 @@ def get_settings() -> Settings:
     defaults = _load_yaml(CONFIG_DIR / "default.yaml")
     models = _load_yaml(CONFIG_DIR / "models.yaml")
 
-    database_url = os.getenv("database_url") or os.getenv("DATABASE_URL")
-    if not database_url:
-        raise RuntimeError(
-            "database_url is not set. Add it to .env, e.g.\n"
-            "  database_url=postgresql://user:pass@localhost:5432/anpr"
-        )
+    database_url = os.getenv("database_url") or os.getenv("DATABASE_URL") or ""
 
     return Settings(
         database_url=database_url,
@@ -164,6 +159,13 @@ def get_settings() -> Settings:
         api_base_url=os.getenv("API_BASE_URL", "http://127.0.0.1:8002"),
         redis_url=os.getenv("REDIS_URL", ""),
     )
+
+
+def reload_settings() -> Settings:
+    """Reload environment variables and refresh cached settings."""
+    load_dotenv(ROOT_DIR / ".env", override=True)
+    get_settings.cache_clear()
+    return get_settings()
 
 
 def build_debug_config():

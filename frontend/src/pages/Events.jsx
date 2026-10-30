@@ -79,7 +79,7 @@ export default function Events() {
           <table className="data-table">
             <thead>
               <tr>
-                <th>Image</th>
+                <th className="min-w-[150px]">Vehicle & Plate</th>
                 <th>Plate</th>
                 <th>Type</th>
                 <th>Vehicle Color</th>
@@ -96,16 +96,55 @@ export default function Events() {
               {events.map((e) => (
                 <tr key={e.id}>
                   <td>
-                    {e.image_path ? (
-                      <img
-                        src={`/api/media/${e.image_path}`}
-                        alt=""
-                        className="w-14 h-10 object-cover rounded cursor-pointer hover:opacity-80"
-                        onClick={() => setPreview(e)}
-                      />
-                    ) : (
-                      <div className="w-14 h-10 surface-1 rounded" />
-                    )}
+                    <div className="flex items-center gap-2 py-0.5">
+                      {/* Vehicle Image */}
+                      <div className="flex flex-col items-center">
+                        {e.vehicle_image_path ? (
+                          <img
+                            src={`/api/media/${e.vehicle_image_path}`}
+                            alt="Vehicle"
+                            title="Vehicle Overview (Click to zoom)"
+                            className="w-16 h-11 object-cover rounded border border-app cursor-pointer hover:border-blue-500 hover:scale-105 transition shadow-sm"
+                            onClick={() => setPreview(e)}
+                          />
+                        ) : (
+                          <div className="w-16 h-11 surface-1 rounded flex items-center justify-center text-[9px] text-app-muted border border-app">
+                            No Veh
+                          </div>
+                        )}
+                        <span className="text-[9px] text-app-muted mt-0.5 uppercase tracking-wide font-medium">
+                          Vehicle
+                        </span>
+                      </div>
+
+                      {/* Number Plate Crop */}
+                      <div className="flex flex-col items-center">
+                        {e.plate_image_path ? (
+                          <img
+                            src={`/api/media/${e.plate_image_path}`}
+                            alt="Plate"
+                            title="Number Plate Crop (Click to zoom)"
+                            className="w-16 h-11 object-cover rounded border border-app cursor-pointer hover:border-blue-500 hover:scale-105 transition shadow-sm"
+                            onClick={() => setPreview(e)}
+                          />
+                        ) : e.image_path ? (
+                          <img
+                            src={`/api/media/${e.image_path}`}
+                            alt="Plate"
+                            title="Plate (Click to zoom)"
+                            className="w-16 h-11 object-cover rounded border border-app cursor-pointer hover:border-blue-500 hover:scale-105 transition shadow-sm"
+                            onClick={() => setPreview(e)}
+                          />
+                        ) : (
+                          <div className="w-16 h-11 surface-1 rounded flex items-center justify-center text-[9px] text-app-muted border border-app">
+                            No Plate
+                          </div>
+                        )}
+                        <span className="text-[9px] text-blue-400 mt-0.5 uppercase tracking-wide font-medium">
+                          Plate
+                        </span>
+                      </div>
+                    </div>
                   </td>
                   <td className="font-mono">
                     {e.plate_number || (
@@ -163,9 +202,16 @@ export default function Events() {
       </div>
       {preview && (
         <ImageLightbox
-          src={`/api/media/${preview.image_path}`}
+          vehicleSrc={preview.vehicle_image_path ? `/api/media/${preview.vehicle_image_path}` : null}
+          plateSrc={
+            preview.plate_image_path
+              ? `/api/media/${preview.plate_image_path}`
+              : (preview.image_path ? `/api/media/${preview.image_path}` : null)
+          }
+          src={preview.image_path ? `/api/media/${preview.image_path}` : null}
           alt={preview.plate_number || 'no plate'}
           filename={`${preview.plate_number || 'noplate'}_${preview.id}.jpg`}
+          event={preview}
           onClose={() => setPreview(null)}
         />
       )}

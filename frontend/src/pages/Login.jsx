@@ -1,6 +1,7 @@
-import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useState, useEffect } from 'react'
+import { useNavigate, Link } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
+import client from '../api/client'
 
 export default function Login() {
   const { login } = useAuth()
@@ -9,6 +10,20 @@ export default function Login() {
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    async function checkSetup() {
+      try {
+        const res = await client.get('/setup/status')
+        if (res.data?.setup_required) {
+          navigate('/setup')
+        }
+      } catch (err) {
+        console.warn('Could not verify setup status:', err)
+      }
+    }
+    checkSetup()
+  }, [navigate])
 
   async function onSubmit(e) {
     e.preventDefault()
@@ -55,9 +70,12 @@ export default function Login() {
         >
           {loading ? 'Signing in…' : 'Sign In'}
         </button>
-        <p className="text-xs text-app-muted mt-4 text-center">
-          Default: admin / admin123
-        </p>
+        <div className="flex items-center justify-between text-xs text-app-muted mt-4">
+          <span>Rising IT ANPR</span>
+          <Link to="/setup" className="text-blue-400 hover:underline">
+            System Setup
+          </Link>
+        </div>
       </form>
     </div>
   )

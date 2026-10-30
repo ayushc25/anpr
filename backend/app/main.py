@@ -2,13 +2,13 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, APIRouter, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .api.v1.router import api_router
 from .core.config import get_settings
-from .routers import auth, cameras, dashboard, events, locations, logs, reports, users, vehicles
+from .routers import auth, cameras, dashboard, events, locations, logs, reports, setup, users, vehicles
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("anpr").setLevel(logging.INFO)
@@ -37,28 +37,28 @@ async def lifespan(app: FastAPI):
     # The UI still drives the legacy in-process camera workers: routers/
     # cameras.py starts one on create/update, so without starting the enabled
     # ones here a restart leaves every camera dead until someone re-saves it.
-    #
-    # This is the last piece of inference still living inside FastAPI. Set
-    # ENABLE_LEGACY_CAMERA_WORKERS=0 once the UI is switched over to the
-    # supervisor (`python -m backend.app.cli supervisor`), which runs each
-    # camera in its own process with the validated pipeline.
     legacy = os.getenv("ENABLE_LEGACY_CAMERA_WORKERS", "1") not in ("0", "false", "False")
     if legacy:
         from .services import camera_manager
 
-        logger.warning(
-            "starting LEGACY in-process camera workers. These use the old "
-            "single-frame pipeline; run 'python -m backend.app.cli supervisor' "
-            "and set ENABLE_LEGACY_CAMERA_WORKERS=0 for the validated one."
-        )
-        camera_manager.start_all_cameras()
+        try:
+            logger.info("starting camera workers...")
+            camera_manager.start_all_cameras()
+        except Exception as exc:
+            logger.warning(
+                "Could not start camera workers on boot (database may be unconfigured or unreachable): %s",
+                exc,
+            )
     try:
         yield
     finally:
         if legacy:
             from .services import camera_manager
 
-            camera_manager.stop_all_cameras()
+            try:
+                camera_manager.stop_all_cameras()
+            except Exception:
+                pass
 
 
 def _warn_if_migrations_pending() -> None:
@@ -67,6 +67,10 @@ def _warn_if_migrations_pending() -> None:
         from sqlalchemy import text
 
         from .db.session import engine
+
+        if engine is None:
+            logger.info("Database engine not initialized; system setup may be pending.")
+            return
 
         script = ScriptDirectory(str(settings.root_dir / "backend" / "alembic"))
         head = script.get_current_head()
@@ -97,31 +101,29 @@ app.mount("/media", StaticFiles(directory=str(settings.media_root)), name="media
 
 app.include_router(api_router)
 
-# Prototype routers, still at their original paths so the existing frontend
-# keeps working while they are migrated into api/v1 one at a time.
-for router in (auth, users, locations, cameras, vehicles, events, dashboard, reports, logs):
-    app.include_router(router.router)
-
-
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "ANPR System API", "version": app.version}
+# Mount prototype routers both at root and with /api prefix so frontend calls work
+# identically with or without Vite dev proxy.
+api_wrapper = APIRouter(prefix="/api")
+for router_mod in (auth, users, locations, cameras, vehicles, events, dashboard, reports, logs, setup):
+    app.include_router(router_mod.router)
+    api_wrapper.include_router(router_mod.router)
+app.include_router(api_wrapper)
 
 
 @app.get("/health")
 def health():
     """Liveness plus the things that actually break on an edge box."""
     from sqlalchemy import text
-
     from .db.session import engine
 
     checks = {"database": False, "media_writable": False}
-    try:
-        with engine.connect() as connection:
-            connection.execute(text("SELECT 1"))
-        checks["database"] = True
-    except Exception:
-        logger.warning("health: database unreachable", exc_info=True)
+    if engine is not None:
+        try:
+            with engine.connect() as connection:
+                connection.execute(text("SELECT 1"))
+            checks["database"] = True
+        except Exception:
+            logger.warning("health: database unreachable", exc_info=True)
     try:
         probe = settings.media_root / ".healthcheck"
         probe.write_text("ok", encoding="utf-8")
@@ -131,3 +133,32 @@ def health():
         logger.warning("health: media directory not writable", exc_info=True)
 
     return {"status": "ok" if all(checks.values()) else "degraded", "checks": checks}
+
+
+# Serve built frontend Single Page App (SPA) if present
+frontend_dist = settings.root_dir / "frontend" / "dist"
+if frontend_dist.is_dir():
+    assets_dir = frontend_dist / "assets"
+    if assets_dir.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+    from fastapi.responses import FileResponse
+
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str = ""):
+        # Don't intercept API or media paths
+        if full_path.startswith(("api/", "media/", "docs", "openapi.json", "auth/")):
+            raise HTTPException(status_code=404, detail="Not found")
+
+        file_path = frontend_dist / full_path
+        if full_path and file_path.is_file():
+            return FileResponse(file_path)
+
+        index_file = frontend_dist / "index.html"
+        if index_file.is_file():
+            return FileResponse(index_file)
+        return {"status": "ok", "service": "ANPR System API", "version": app.version}
+else:
+    @app.get("/")
+    def root():
+        return {"status": "ok", "service": "ANPR System API", "version": app.version}

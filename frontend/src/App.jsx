@@ -3,6 +3,7 @@ import { AuthProvider } from './context/AuthContext'
 import { ThemeProvider } from './context/ThemeContext'
 import ProtectedRoute from './components/ProtectedRoute'
 import Login from './pages/Login'
+import Setup from './pages/Setup'
 import Dashboard from './pages/Dashboard'
 import LiveView from './pages/LiveView'
 import Events from './pages/Events'
@@ -21,6 +22,7 @@ export default function App() {
         <BrowserRouter>
           <Routes>
             <Route path="/login" element={<Login />} />
+            <Route path="/setup" element={<Setup />} />
             <Route path="/" element={<ProtectedRoute permission="dashboard"><Dashboard /></ProtectedRoute>} />
             <Route path="/live" element={<ProtectedRoute permission="live"><LiveView /></ProtectedRoute>} />
             <Route path="/events" element={<ProtectedRoute permission="events"><Events /></ProtectedRoute>} />

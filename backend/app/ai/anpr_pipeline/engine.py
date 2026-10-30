@@ -53,6 +53,7 @@ class VehicleEvent:
     snapshot: Image.Image
     valid: bool = True
     raw_crop_bytes: Optional[bytes] = None
+    vehicle_snapshot: Optional[Image.Image] = None
 
 
 def _pad(x1, y1, x2, y2, w, h, frac=0.08):
@@ -181,8 +182,9 @@ class StreamSession:
         same = [r for r in v.reads if r[1] == plate]
         best_read = max(same, key=lambda r: r[3])
         crop = best_read[4]
+        veh_crop = best_read[5] if len(best_read) > 5 else None
         avg_conf = sum(r[2] for r in same) / max(agree, 1)
-        return VehicleEvent(plate, v.first, len(v.reads), agree, avg_conf, crop, is_valid(plate))
+        return VehicleEvent(plate, v.first, len(v.reads), agree, avg_conf, crop, is_valid(plate), vehicle_snapshot=veh_crop)
 
     def _settle(self, t_sec, force=False):
         s = self.engine.settings
@@ -215,13 +217,20 @@ class StreamSession:
                 draw_label(out, box, "too far", AMBER)
                 continue
             crop = Image.fromarray(cv2.cvtColor(bgr[box[1]:box[3], box[0]:box[2]], cv2.COLOR_BGR2RGB))
+            pw = box[2] - box[0]
+            ph = box[3] - box[1]
+            vx1 = max(0, int(box[0] - pw * 1.5))
+            vy1 = max(0, int(box[1] - ph * 3.5))
+            vx2 = min(w, int(box[2] + pw * 1.5))
+            vy2 = min(h, int(box[3] + ph * 1.5))
+            veh_crop = Image.fromarray(cv2.cvtColor(bgr[vy1:vy2, vx1:vx2], cv2.COLOR_BGR2RGB))
             text, _, conf = self.engine.read_plate(crop)
             if not is_valid(text):
                 draw_label(out, box, "reading...", AMBER)
                 detected_boxes.append({"bbox": box, "plate": text, "conf": conf, "status": "reading"})
                 continue
             v = self._vehicle_for(text, t_sec)
-            v.reads.append((t_sec, text, conf, width, crop))
+            v.reads.append((t_sec, text, conf, width, crop, veh_crop))
             v.last = t_sec
             shown = v.logged or v.best()[0]
             draw_label(out, box, shown, GREEN if v.logged else AMBER)

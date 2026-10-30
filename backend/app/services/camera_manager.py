@@ -241,8 +241,11 @@ class CameraWorker:
         self.camera_id = camera_id
         self.rtsp_url = rtsp_url
         self.stop_event = threading.Event()
+        self.latest_raw_frame: Optional[np.ndarray] = None
         self.latest_jpeg: Optional[bytes] = None
         self.frame_lock = threading.Lock()
+        self.last_boxes: list = []
+        self.boxes_lock = threading.Lock()
         self.online = False
         # plate -> (last_seen_ts, event_id, score)
         self._recent_plates: dict[str, tuple] = {}
@@ -250,10 +253,12 @@ class CameraWorker:
         from ..ai.anpr_pipeline import ANPREngine
         self.engine = ANPREngine.get_shared()
         self.session = self.engine.new_session(source_name=f"camera-{self.camera_id}")
-        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.inference_thread = threading.Thread(target=self._inference_loop, daemon=True)
 
     def start(self):
-        self.thread.start()
+        self.capture_thread.start()
+        self.inference_thread.start()
 
     def stop(self):
         self.stop_event.set()
@@ -283,21 +288,26 @@ class CameraWorker:
         except OSError:
             return False
 
-    def _run(self):
+    def _capture_loop(self):
+        """Dedicated high-speed frame grabber. Pulls frames at native camera FPS (25-30 FPS)
+        without ever waiting for AI inference. This prevents RTSP decoder queue lag."""
+        os.environ.setdefault(
+            "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+            "rtsp_transport;tcp|stimeout;5000000|max_delay;500000|fflags;nobuffer|flags;low_delay",
+        )
         while not self.stop_event.is_set():
             cap = cv2.VideoCapture(self.rtsp_url)
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+
             if not cap.isOpened():
                 self._set_online(False)
                 time.sleep(5)
                 continue
-            self._set_online(True)
-            last_detect = 0.0
-            last_boxes = []
 
-            # Play a FILE at its native rate. Without this the reader chews
-            # through a two-minute clip in ~29 s and immediately replays it,
-            # so the same cars arrive again and again — which looks exactly
-            # like duplicate events in the table, but is the clip looping.
+            self._set_online(True)
             source_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0) if self._is_file_source else 0.0
             frame_period = (1.0 / source_fps) if source_fps > 1 else 0.0
             next_frame_at = time.monotonic()
@@ -315,36 +325,61 @@ class CameraWorker:
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     break
-                now = time.time()
-                if now - last_detect >= DETECTION_FRAME_INTERVAL:
-                    last_detect = now
-                    try:
-                        annotated, events, boxes = self.session.process(frame, now)
-                        frame = annotated
-                        for ev in events:
-                            self._record_session_event(ev)
-                        last_boxes = boxes
-                    except Exception:
-                        logger.exception("camera %s: detection pass failed", self.camera_id)
-                        last_boxes = []
-                else:
-                    self._draw_overlay(frame, last_boxes)
-                # Encoding 1080p costs ~64 ms per frame. Downscaling the
-                # preview cuts that by an order of magnitude and nobody can
-                # see the difference in a browser panel.
-                preview = frame
-                if frame.shape[1] > PREVIEW_MAX_WIDTH:
-                    scale = PREVIEW_MAX_WIDTH / frame.shape[1]
-                    preview = cv2.resize(frame, (PREVIEW_MAX_WIDTH, int(frame.shape[0] * scale)),
-                                         interpolation=cv2.INTER_AREA)
-                ok2, buf = cv2.imencode(".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+
+                # Update the latest frame for AI worker
+                with self.frame_lock:
+                    self.latest_raw_frame = frame
+
+                # Draw latest bounding boxes overlay without blocking
+                display_frame = frame.copy()
+                with self.boxes_lock:
+                    boxes = list(self.last_boxes)
+                self._draw_overlay(display_frame, boxes)
+
+                # Downscale preview for fast, smooth web streaming
+                preview = display_frame
+                if display_frame.shape[1] > PREVIEW_MAX_WIDTH:
+                    scale = PREVIEW_MAX_WIDTH / display_frame.shape[1]
+                    preview = cv2.resize(
+                        display_frame,
+                        (PREVIEW_MAX_WIDTH, int(display_frame.shape[0] * scale)),
+                        interpolation=cv2.INTER_AREA,
+                    )
+
+                ok2, buf = cv2.imencode(".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
                 if ok2:
                     with self.frame_lock:
                         self.latest_jpeg = buf.tobytes()
+
             cap.release()
             self._set_online(False)
             if not self.stop_event.is_set():
                 time.sleep(3)
+
+    def _inference_loop(self):
+        """Asynchronous background AI inference worker. Grabs the freshest frame every
+        DETECTION_FRAME_INTERVAL without slowing down the video capture loop."""
+        while not self.stop_event.is_set():
+            if self.stop_event.wait(DETECTION_FRAME_INTERVAL):
+                break
+
+            with self.frame_lock:
+                frame_to_process = self.latest_raw_frame.copy() if self.latest_raw_frame is not None else None
+
+            if frame_to_process is None:
+                continue
+
+            now = time.time()
+            try:
+                annotated, events, boxes = self.session.process(frame_to_process, now)
+                for ev in events:
+                    self._record_session_event(ev)
+                with self.boxes_lock:
+                    self.last_boxes = boxes
+            except Exception:
+                logger.exception("camera %s: detection pass failed", self.camera_id)
+                with self.boxes_lock:
+                    self.last_boxes = []
 
     def _draw_overlay(self, frame, boxes):
         for b in boxes:
@@ -361,13 +396,22 @@ class CameraWorker:
             status, vehicle_row = self._classify(db, ev.plate)
             plate = vehicle_row.plate_number if vehicle_row else ev.plate
 
-            image_rel = None
+            plate_rel = None
             if ev.snapshot is not None:
                 import io
                 buf = io.BytesIO()
                 ev.snapshot.convert("RGB").save(buf, format="JPEG", quality=90)
                 crop_bytes = buf.getvalue()
-                image_rel = self._save_image(crop_bytes, plate, cam.name if cam else None)
+                plate_rel = self._save_image(crop_bytes, f"{plate}_plate", cam.name if cam else None)
+
+            vehicle_rel = None
+            if getattr(ev, "vehicle_snapshot", None) is not None:
+                import io
+                vbuf = io.BytesIO()
+                ev.vehicle_snapshot.convert("RGB").save(vbuf, format="JPEG", quality=85)
+                vehicle_rel = self._save_image(vbuf.getvalue(), plate, cam.name if cam else None)
+            else:
+                vehicle_rel = plate_rel
 
             event = models.Event(
                 plate_number=plate,
@@ -382,7 +426,8 @@ class CameraWorker:
                 detect_confidence=1.0,
                 plate_confidence=float(ev.confidence),
                 read_count=int(ev.agree),
-                vehicle_image_path=image_rel,
+                vehicle_image_path=vehicle_rel,
+                plate_image_path=plate_rel,
             )
             db.add(event)
             db.commit()
@@ -752,4 +797,4 @@ def mjpeg_generator(camera_id: int):
         if frame is None:
             frame = _placeholder_frame()
         yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
-        time.sleep(0.1)
+        time.sleep(0.04)  # ~25 FPS for smooth live video
